@@ -182,7 +182,7 @@ from core.python_library_registry import (
 
 
 APP_NAME = "Astra Studio"
-APP_VERSION = "Release 3.20"
+APP_VERSION = "Release 4.0"
 WINDOWS_APP_USER_MODEL_ID = "Astra.Studio.Alaron"
 APP_DIR_NAME = "AstralStudio"
 PUBLIC_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/alarongh/Astra-Studio-Releases/main/update/latest.json"
@@ -196,7 +196,7 @@ ANGEL_404_THEME = "Angel 404: Фиолетовый сбой"
 ANGEL_404_ACCENT = "Angel 404 неон"
 ANGEL_404_WALLPAPER = "Angel 404"
 SHORTCUT_ICON_OPTIONS = {
-    "Astra 3.20 — красно-синий": "assets/astra.ico",
+    "Astra 4.0 — красно-синий": "assets/astra.ico",
     "Angel 404 — фиолетовый неон": "assets/astra_angel404.ico",
     "Astra Legacy — тёмная корона": "assets/legacy_astra.ico",
 }
@@ -506,6 +506,28 @@ LANGUAGES = {
 # being polished in the current acceptance cycle.
 VISIBLE_LANGUAGES = ("Java", "Python", "C++", "JavaScript", "HTML", "CSS")
 
+# Release 4.0 keeps the previous language implementations available for opening
+# existing files, while the default workspace and project tree focus on the six
+# languages that are currently supported in the main interface.
+VISIBLE_PROJECT_EXTENSIONS = frozenset(
+    extension
+    for language in VISIBLE_LANGUAGES
+    for extension in LANGUAGES[language]["extensions"]
+)
+NEUTRAL_PROJECT_EXTENSIONS = frozenset({
+    ".txt", ".md", ".markdown", ".json", ".jsonc", ".yaml", ".yml",
+    ".toml", ".xml", ".xsd", ".svg", ".ini", ".cfg", ".conf",
+})
+LEGACY_INTERNAL_WORKSPACE_EXAMPLES = {
+    "script.ts": TYPESCRIPT_TEMPLATE,
+    "script.luau": LUAU_TEMPLATE,
+    "script.gd": GDSCRIPT_TEMPLATE,
+    "index.php": PHP_TEMPLATE,
+    "script.ps1": POWERSHELL_TEMPLATE,
+    "Program.cs": CSHARP_TEMPLATE,
+    "query.sql": SQL_TEMPLATE,
+}
+
 SPECIAL_FILENAMES_TO_LANGUAGE = {
     "dockerfile": "Dockerfile",
     "containerfile": "Dockerfile",
@@ -518,10 +540,9 @@ EXTENSION_TO_LANGUAGE = {
 
 PROJECT_FILE_FILTERS = [
     "*.py", "*.cpp", "*.cc", "*.cxx", "*.hpp", "*.h", "*.java",
-    "*.html", "*.htm", "*.css", "*.js", "*.mjs", "*.cjs", "*.jsx", "*.ts", "*.tsx", "*.mts", "*.cts",
-    "*.luau", "*.lua", "*.gd", "*.php", "*.ps1", "*.psm1", "*.psd1", "*.cs", "*.sql",
+    "*.html", "*.htm", "*.css", "*.js", "*.mjs", "*.cjs", "*.jsx",
     "*.json", "*.jsonc", "*.yaml", "*.yml", "*.md", "*.markdown", "*.toml", "*.xml", "*.xsd", "*.svg",
-    "*.sh", "*.bash", "*.txt", "Dockerfile", "Dockerfile.*", "Containerfile", "Containerfile.*", ".env", ".env.*",
+    "*.txt", "*.ini", "*.cfg", "*.conf",
 ]
 
 
@@ -3084,6 +3105,7 @@ class AstraStudio(QMainWindow):
     def __init__(self):
         super().__init__()
         self.run_process = None
+        self.run_workflow_active = False
         self.terminal_process = None
         self.install_process = None
         self.update_network = QNetworkAccessManager(self)
@@ -3514,19 +3536,13 @@ class AstraStudio(QMainWindow):
             "index.html": HTML_TEMPLATE,
             "style.css": CSS_TEMPLATE,
             "script.js": JAVASCRIPT_TEMPLATE,
-            "script.ts": TYPESCRIPT_TEMPLATE,
-            "script.luau": LUAU_TEMPLATE,
-            "script.gd": GDSCRIPT_TEMPLATE,
-            "index.php": PHP_TEMPLATE,
-            "script.ps1": POWERSHELL_TEMPLATE,
-            "Program.cs": CSHARP_TEMPLATE,
-            "query.sql": SQL_TEMPLATE,
             "config.json": JSON_TEMPLATE,
             "config.yaml": YAML_TEMPLATE,
             "README.md": MARKDOWN_TEMPLATE,
         }
         target_dir = self.internal_workspace_dir
         target_dir.mkdir(parents=True, exist_ok=True)
+        self._archive_legacy_workspace_examples(target_dir)
         for filename, text in examples.items():
             path = target_dir / filename
             if path.exists():
@@ -3535,6 +3551,34 @@ class AstraStudio(QMainWindow):
                 path.write_text(text, encoding="utf-8")
             except OSError as exc:
                 self.write_exception_log(f"Не удалось создать стартовый пример: {filename}", exc)
+
+    def _archive_legacy_workspace_examples(self, target_dir: Path) -> list[Path]:
+        """Move obsolete generated examples out of the active workspace.
+
+        The old files are archived instead of deleted so an edited sample can
+        always be recovered. This migration is intentionally limited to the
+        Astra-owned internal workspace and never touches a user-selected folder.
+        """
+        target_dir = Path(target_dir)
+        if target_dir.resolve() != self.internal_workspace_dir.resolve():
+            return []
+        archived: list[Path] = []
+        backup_dir = self.data_dir / "legacy_workspace_backup"
+        for filename in LEGACY_INTERNAL_WORKSPACE_EXAMPLES:
+            source = target_dir / filename
+            if not source.is_file():
+                continue
+            try:
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                destination = backup_dir / filename
+                if destination.exists():
+                    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                    destination = backup_dir / f"{source.stem}-{stamp}{source.suffix}"
+                shutil.move(str(source), str(destination))
+                archived.append(destination)
+            except OSError as exc:
+                self.write_exception_log(f"Не удалось архивировать старый пример: {filename}", exc)
+        return archived
 
     def _build_ui(self):
         root = QWidget()
@@ -3645,6 +3689,7 @@ class AstraStudio(QMainWindow):
         self.btn_lint.setToolTip("Проверить текущий файл и показать строки с ошибками")
         self.btn_build_exe = QPushButton("⧉  Собрать EXE")
         self.btn_stop = QPushButton("■  Остановить")
+        self.btn_stop.setVisible(False)
         self.btn_new = QPushButton("+  Создать файл")
         self.btn_open = QPushButton("⌁  Открыть файл")
         self.btn_save = QPushButton("✓  Сохранить")
@@ -3718,7 +3763,6 @@ class AstraStudio(QMainWindow):
         side_layout.addWidget(self.btn_format)
         side_layout.addWidget(self.btn_lint)
         side_layout.addWidget(self.btn_build_exe)
-        side_layout.addWidget(self.btn_stop)
         side_layout.addSpacing(10)
         side_layout.addWidget(self.btn_new)
         side_layout.addWidget(self.btn_open)
@@ -3877,8 +3921,8 @@ class AstraStudio(QMainWindow):
 
         self.project_panel = QFrame()
         self.project_panel.setObjectName("ProjectPanel")
-        self.project_panel.setMinimumWidth(270)
-        self.project_panel.setMaximumWidth(420)
+        self.project_panel.setMinimumWidth(240)
+        self.project_panel.setMaximumWidth(16777215)
         self.project_panel.setFrameShape(QFrame.Shape.StyledPanel)
         self.project_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         project_layout = QVBoxLayout(self.project_panel)
@@ -4652,6 +4696,8 @@ class AstraStudio(QMainWindow):
         main_sizes[1] = max(520, int(main_sizes[1] or 0))
         self.main_splitter.setSizes(main_sizes[:2])
         self.main_splitter.setHandleWidth(8)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 3)
 
         editor_page = QWidget()
         editor_page_layout = QVBoxLayout(editor_page)
@@ -4766,7 +4812,7 @@ class AstraStudio(QMainWindow):
         self.btn_close_tools_drawer.clicked.connect(self.close_tools_drawer)
         self.btn_close_settings_page.clicked.connect(self.close_settings_page)
         self.btn_restore_sidebar.clicked.connect(self.toggle_main_sidebar)
-        self.btn_run.clicked.connect(self.run_code)
+        self.btn_run.clicked.connect(self.toggle_run_code)
         self.btn_compile.clicked.connect(self.compile_code)
         self.btn_format.clicked.connect(self.format_current_file)
         self.btn_lint.clicked.connect(self.lint_current_file)
@@ -4884,7 +4930,7 @@ class AstraStudio(QMainWindow):
             widget.setTabStopDistance(widget.fontMetrics().horizontalAdvance(" ") * 4)
 
     def _setup_shortcuts(self):
-        QShortcut(QKeySequence("F5"), self, self.run_code)
+        QShortcut(QKeySequence("F5"), self, self.toggle_run_code)
         QShortcut(QKeySequence("Ctrl+S"), self, self.save_current_file)
         QShortcut(QKeySequence("Ctrl+Shift+S"), self, self.save_current_file_as)
         QShortcut(QKeySequence("Ctrl+O"), self, self.open_file_dialog)
@@ -6256,6 +6302,9 @@ class AstraStudio(QMainWindow):
             # Сохранение текущего файла оставляем доступным: оно безопасно и не меняет процесс сборки.
             if getattr(self, "btn_save", None) is button:
                 continue
+            if getattr(self, "btn_run", None) is button:
+                button.setEnabled(not active or self._run_workflow_is_active())
+                continue
             button.setEnabled(not active)
 
     def _start_process_task(
@@ -6318,6 +6367,8 @@ class AstraStudio(QMainWindow):
 
     def _on_task_started(self, task_id: str, title: str):
         context = self.active_task_context if self.active_task_context.get("task_id") == task_id else {}
+        if context.get("run_after"):
+            self._set_run_button_running(True)
         self._set_long_task_ui(True, title, bool(context.get("indeterminate", True)))
         self.statusBar().showMessage(title, 2000)
 
@@ -6366,6 +6417,8 @@ class AstraStudio(QMainWindow):
 
     def _on_task_failed(self, task_id: str, message: str):
         context = self.active_task_context if self.active_task_context.get("task_id") == task_id else {}
+        if context.get("run_after"):
+            self._set_run_button_running(False)
         if context.get("mode") == "compile" and context.get("language") == "Java":
             self._append_task_text(task_id, f"\n✕ javac найден, но процесс компилятора не запустился: {message}\n", "stderr")
             self.write_log(f"[Java] compile launch failed: {message}")
@@ -6405,6 +6458,8 @@ class AstraStudio(QMainWindow):
             if target == "installer":
                 self.set_progress(max(1, self.install_progress_bar.value()), "Операция отменена")
             self._finish_task_ui(False, True)
+            if context.get("run_after"):
+                self._set_run_button_running(False)
             self.active_task_context = {}
             return
 
@@ -6713,6 +6768,8 @@ class AstraStudio(QMainWindow):
             self._append_task_text(task_id, f"\n■ Процесс завершён с кодом {exit_code}\n", "stdout")
 
         self._finish_task_ui(success, False)
+        if context.get("run_after"):
+            self._set_run_button_running(False)
         self.active_task_context = {}
 
     def _run_after_compile(self, context: dict):
@@ -7139,6 +7196,34 @@ class AstraStudio(QMainWindow):
         match = re.search(r"class\s+([A-Za-z_][A-Za-z0-9_]*)", text)
         return match.group(1) if match else None
 
+    def _run_workflow_is_active(self) -> bool:
+        if bool(getattr(self, "run_workflow_active", False)):
+            return True
+        if self.run_process and self.run_process.state() != QProcess.ProcessState.NotRunning:
+            return True
+        return bool(
+            self.task_manager.has_active_task()
+            and self.active_task_context.get("run_after")
+        )
+
+    def _set_run_button_running(self, active: bool):
+        self.run_workflow_active = bool(active)
+        if not hasattr(self, "btn_run"):
+            return
+        if active:
+            self.btn_run.setText("■  Остановить   F5")
+            self.btn_run.setToolTip("Остановить компиляцию или запущенную программу · F5")
+            self.btn_run.setEnabled(True)
+        else:
+            self.btn_run.setText("▶  Запустить   F5")
+            self.btn_run.setToolTip("Запустить текущий файл · F5")
+
+    def toggle_run_code(self):
+        if self._run_workflow_is_active():
+            self.stop_run_process()
+            return
+        self.run_code()
+
     def run_code(self):
         if self.run_process and self.run_process.state() != QProcess.ProcessState.NotRunning:
             self.output_console.appendPlainText("\nПроцесс уже запущен. Нажми «Остановить», если нужно завершить его.")
@@ -7274,6 +7359,7 @@ class AstraStudio(QMainWindow):
             return
 
     def _start_process(self, program, arguments, workdir, output_encoding=None):
+        self._set_run_button_running(True)
         self.run_process = QProcess(self)
         self.run_process.setWorkingDirectory(str(workdir))
         self.run_process.setProgram(str(program))
@@ -7291,6 +7377,7 @@ class AstraStudio(QMainWindow):
         self.run_process.start()
 
     def _run_process_start_failed(self, program):
+        self._set_run_button_running(False)
         if self.last_run_language == "Java":
             self.output_console.appendPlainText(f"✕ Java runtime найден, но процесс запуска не стартовал: {program}")
             self.write_log(f"[Java] launch failed: {program}")
@@ -7319,6 +7406,7 @@ class AstraStudio(QMainWindow):
         self._append_to_output(data)
 
     def _run_process_finished(self, exit_code, _exit_status):
+        self._set_run_button_running(False)
         self.output_console.appendPlainText(f"\n\n■ Процесс завершён с кодом {exit_code}")
         if self.last_run_language == "Java":
             self.write_log(f"[Java] launch exit={exit_code}")
@@ -11482,14 +11570,13 @@ class AstraStudio(QMainWindow):
                 continue
             if child.is_file() and PROJECT_FILE_FILTERS:
                 suffix = child.suffix.lower()
-                # Derive the tree filter from the actual language registry so supported
-                # extensions such as .cc, .cxx, .htm and .mjs cannot silently disappear.
-                allowed = set(EXTENSION_TO_LANGUAGE) | {".txt", ".md", ".json", ".ini", ".cfg", ".conf"}
+                # Release 4.0 keeps the tree focused on the six visible languages.
+                # Neutral project/configuration files remain visible, while files
+                # owned by currently hidden language implementations stay on disk.
+                allowed = VISIBLE_PROJECT_EXTENSIONS | NEUTRAL_PROJECT_EXTENSIONS
                 lower_name = child.name.lower()
                 special = (
-                    lower_name in SPECIAL_FILENAMES_TO_LANGUAGE
-                    or lower_name.startswith(("dockerfile", "containerfile", ".env"))
-                    or lower_name in {"project.godot", ".gitignore"}
+                    lower_name in {".gitignore", ".gitattributes"}
                 )
                 if suffix and suffix not in allowed and not special:
                     continue
@@ -13362,17 +13449,15 @@ Astra-Progress 100
         if not all(hasattr(self, name) for name in ("tools_drawer", "project_panel", "main_splitter")):
             return
         tools_open = not self.tools_drawer.isHidden()
-        compact = self.width() < 1900 and tools_open
         was_hidden = bool(getattr(self, "_responsive_project_hidden", False))
-        if compact and not self.project_panel.isHidden():
-            self.project_panel.setVisible(False)
-            self._responsive_project_hidden = True
-            self.main_splitter.setSizes([0, max(320, self.main_splitter.width())])
-        elif not compact and was_hidden:
+        # The project tree is user-sized and must never disappear merely because
+        # another drawer opened or Windows DPI scaling reduced logical width.
+        if was_hidden:
             self.project_panel.setVisible(True)
             self._responsive_project_hidden = False
             total = max(530, self.main_splitter.width())
-            self.main_splitter.setSizes([230, max(300, total - 230)])
+            restored_width = max(240, int((self.saved_main_splitter_sizes or [320])[0] or 320))
+            self.main_splitter.setSizes([restored_width, max(300, total - restored_width)])
         if hasattr(self, "root_splitter") and tools_open:
             total = max(720, self.root_splitter.width())
             sidebar_visible = getattr(self, "sidebar_shell", None) is not None and self.sidebar_shell.isVisible()

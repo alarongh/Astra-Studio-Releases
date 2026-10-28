@@ -409,7 +409,12 @@ class LspClientConnection(QObject):
         while self.process and self.process.state() != QProcess.ProcessState.NotRunning and time.monotonic() < deadline:
             if app is not None:
                 app.processEvents()
-            self.process.waitForReadyRead(20)
+            # Qt may deliver finished() while events are processed and clear
+            # self.process. Re-read it before waiting to avoid a shutdown race.
+            process = self.process
+            if process is None or process.state() == QProcess.ProcessState.NotRunning:
+                break
+            process.waitForReadyRead(20)
             self._read_stdout()
             self._read_stderr()
             time.sleep(0.005)
@@ -818,4 +823,3 @@ class LspManager(QObject):
                 changed = True
         if changed:
             self.diagnosticsReset.emit()
-

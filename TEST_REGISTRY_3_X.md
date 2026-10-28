@@ -41,7 +41,7 @@
 - `tests/test_app_updates.py::test_update_channel_accepts_published_https_url`
 - `tests/test_app_updates.py::test_update_archive_verifies_hash_size_layout_and_rejects_traversal`
 - `tests/test_app_updates.py::test_windows_updater_has_wait_backup_rollback_and_restart_steps`
-- `tests/test_app_updates.py::test_release_320_bundles_public_github_channel_and_valid_latest_manifest`
+- `tests/test_app_updates.py::test_release_400_bundles_public_github_channel_and_valid_latest_manifest`
 - `tests/test_app_updates.py::test_windows_updater_replaces_portable_folder_in_isolated_directory`
 - `tests/test_app_updates.py::test_windows_updater_rolls_back_when_new_executable_exits_during_health_check`
 - `tests/test_release_316_editor_recovery.py::test_context_completion_covers_python_javascript_html_and_css`
@@ -62,6 +62,11 @@
 - `tests/test_release_320_fullscreen_and_completion.py::test_all_six_release_languages_have_contextual_completion`
 - `tests/test_release_320_fullscreen_and_completion.py::test_wallpaper_is_single_image_and_project_frame_is_stable`
 - `tests/test_release_320_fullscreen_and_completion.py::test_settings_replace_editor_with_full_page`
+- `tests/test_release_400_workspace_tree_run_button.py::test_internal_workspace_archives_old_language_examples`
+- `tests/test_release_400_workspace_tree_run_button.py::test_project_tree_shows_six_languages_and_neutral_files`
+- `tests/test_release_400_workspace_tree_run_button.py::test_project_tree_can_be_resized_wide_and_is_not_auto_hidden`
+- `tests/test_release_400_workspace_tree_run_button.py::test_run_button_replaces_play_with_stop_for_compilation_and_restores`
+- `tests/test_release_400_workspace_tree_run_button.py::test_release_identity_is_4_0`
 - `tests/test_language_error_classification.py::test_python_compile_diagnostic_points_to_source_line`
 - `tests/test_language_error_classification.py::test_node_diagnostic_points_to_source_line`
 - `tests/test_language_error_classification.py::test_java_runtime_diagnostic_points_to_source_line`
