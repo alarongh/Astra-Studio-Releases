@@ -59,7 +59,7 @@ def _function_language_branches(tree: ast.Module, name: str) -> set[str]:
 
 def test_final_release_identity_and_runtime_tree_has_no_dev_paths():
     tree = _main_tree()
-    assert _literal_assignment(tree, "APP_VERSION") == "Release 3.20"
+    assert _literal_assignment(tree, "APP_VERSION") == "Release 4.0"
     runtime_files = [MAIN, *sorted(CORE.glob("*.py")), *sorted(SCRIPTS.glob("*.ps1")), *sorted(ROOT.glob("*.bat")), *sorted(ROOT.glob("*.vbs"))]
     forbidden = ("/mnt/data", "Astra_Studio_Release_2_3", "Astra_Studio_Release_3_3_pre_", "Release 2.3")
     for path in runtime_files:
@@ -99,11 +99,6 @@ def test_lsp_catalog_matches_all_supported_languages():
 def test_runtime_assets_scripts_and_build_inputs_exist():
     assets = [
         "assets/astra.ico", "assets/astra.png", "assets/astra_angel404.ico", "assets/astra_angel404.png", "assets/astra_studio_title.png",
-        *[f"assets/wallpapers/{name}" for name in (
-            "astra_neon_core.png", "astra_deep_space.png", "astra_blue_horizon.png", "astra_eclipse.png",
-            "astra_crown_night.png", "astra_sakura_dusk.png", "astra_cyber_ritual.png", "astra_crimson_prayer.png",
-            "angel_404.png",
-        )],
         "assets/fonts/minecraft.ttf",
     ]
     scripts = [
@@ -166,7 +161,10 @@ def test_shutdown_paths_cover_tasks_lsp_run_terminal_and_installer():
         assert token in close
     task_text = (CORE / "task_manager.py").read_text(encoding="utf-8")
     assert "def cancel_and_wait" in task_text
-    assert "process.terminate()" in task_text and "process.kill()" in task_text
+    assert "stop_process_and_wait(process, timeout_ms)" in task_text
+    process_text = (CORE / "process_control.py").read_text(encoding="utf-8")
+    assert "process.terminate()" in process_text and "process.kill()" in process_text
+    assert "waitForFinished" in process_text
 
 
 def test_python_project_environment_does_not_adopt_unrelated_virtualenv(tmp_path):
@@ -211,6 +209,8 @@ def test_settings_loader_and_saver_keys_remain_symmetric():
     save_end = text.find("\n    def ", save_start + 20)
     save_text = text[save_start: save_end if save_end != -1 else len(text)]
     loaded = set(re.findall(r'data\.get\("([^"]+)"\)', load_text))
+    appearance_text = (CORE / "appearance.py").read_text(encoding="utf-8")
+    loaded |= set(re.findall(r'settings\.get\("([^"]+)"', appearance_text))
     saved = set(re.findall(r'"([^"]+)"\s*:', save_text))
     legacy_appearance_keys = {
         "aux_bg_transparency_percent",
@@ -261,7 +261,7 @@ def test_final_docs_no_longer_claim_d3_is_next():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG_RELEASE_3_3.md").read_text(encoding="utf-8")
     assert "D3 AI-adjacent workflow NEXT" not in readme
-    assert "Release 3.20" in readme
+    assert "Release 4.0" in readme
     assert "Final Integration Gate" in readme
     assert "D1–D3" in changelog
 

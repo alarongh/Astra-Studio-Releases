@@ -91,6 +91,15 @@ class LspTcpConnection(QObject):
         return bool(self.socket and self.socket.state() != QAbstractSocket.SocketState.UnconnectedState)
 
     def start(self):
+        guard = getattr(self, "launch_guard", None)
+        if guard is not None:
+            try:
+                allowed = bool(guard())
+            except Exception:
+                allowed = False
+            if not allowed:
+                self.shutdown()
+                return
         if self.is_running() or self.state in {self.STARTING, self.INITIALIZING, self.READY}:
             return
         self._restart_timer.stop()

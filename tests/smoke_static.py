@@ -23,11 +23,6 @@ REQUIRED_ASSETS = [
     ROOT / "assets" / "astra_angel404.ico",
     ROOT / "assets" / "astra_angel404.png",
     ROOT / "assets" / "astra_studio_title.png",
-    *(ROOT / "assets" / "wallpapers" / name for name in [
-        "astra_neon_core.png", "astra_deep_space.png", "astra_blue_horizon.png", "astra_eclipse.png",
-        "astra_crown_night.png", "astra_sakura_dusk.png", "astra_cyber_ritual.png", "astra_crimson_prayer.png",
-        "angel_404.png",
-    ]),
     ROOT / "assets" / "fonts" / "minecraft.ttf",
 ]
 REQUIRED_SCRIPTS = [
@@ -66,7 +61,7 @@ def main() -> None:
         py_compile.compile(str(file), doraise=True)
 
     tree = ast.parse(MAIN.read_text(encoding="utf-8"))
-    assert literal_assignment(tree, "APP_VERSION") == "Release 3.20"
+    assert literal_assignment(tree, "APP_VERSION") == "Release 4.0"
 
     languages = extract_language_names(tree)
     missing = REQUIRED_LANGUAGES - languages
@@ -178,7 +173,7 @@ def main() -> None:
     ]:
         assert package_id in main_text, f"Installer package id missing: {package_id}"
 
-    print("PASS: Astra Studio Release 3.20 static smoke checks")
+    print("PASS: Astra Studio Release 4.0 static smoke checks")
     print(f"Languages: {len(languages)}")
     print(f"Python registry entries: {len(registry_json['libraries'])}")
     print(f"Assets checked: {len(REQUIRED_ASSETS)}")

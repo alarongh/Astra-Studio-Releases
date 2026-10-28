@@ -20,6 +20,7 @@ class CompletionItem:
     kind: str
     additional_edits: tuple[CompletionTextEdit, ...] = ()
     cursor_offset: int | None = None
+    text_edit: CompletionTextEdit | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,48 @@ class CompletionQuery:
     end: int
     prefix: str
     items: tuple[CompletionItem, ...]
+
+
+def text_offset_to_utf16(text: str, offset: int) -> int:
+    """Convert provider/Python offsets to QTextCursor and LSP UTF-16 units."""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text[:max(0, int(offset))])
+
+
+def utf16_offset_to_text(text: str, offset: int) -> int:
+    """Convert Qt offsets without splitting a non-BMP Unicode character."""
+    target = max(0, int(offset))
+    units = 0
+    for index, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units > target:
+            return index
+        if units == target:
+            return index + 1
+    return len(text)
+
+
+def completion_edit_plan(text: str, query: CompletionQuery, item: CompletionItem) -> tuple[list[CompletionTextEdit], int]:
+    """Validate all edits before modifying a document; return the final caret."""
+    primary = item.text_edit or CompletionTextEdit(query.start, query.end, item.insert_text)
+    edits = sorted([primary, *item.additional_edits], key=lambda edit: (edit.start, edit.end), reverse=True)
+    last_start = len(text) + 1
+    empty_positions: set[int] = set()
+    for edit in edits:
+        if not 0 <= edit.start <= edit.end <= len(text) or edit.end > last_start:
+            raise ValueError("Invalid or overlapping completion edits")
+        if edit.start == edit.end:
+            if edit.start in empty_positions:
+                raise ValueError("Ambiguous completion insertions at the same position")
+            empty_positions.add(edit.start)
+        last_start = edit.start
+    cursor_offset = item.cursor_offset
+    if cursor_offset is None:
+        cursor_offset = len(primary.new_text) - (1 if primary.new_text.endswith("()") else 0)
+    final_position = primary.start + max(0, min(len(primary.new_text), cursor_offset))
+    for edit in item.additional_edits:
+        if edit.end <= primary.start:
+            final_position += len(edit.new_text) - (edit.end - edit.start)
+    return edits, final_position
 
 
 class CompletionProvider(Protocol):
@@ -43,11 +86,17 @@ class CompletionRegistry:
     def register(self, language: str, provider: CompletionProvider) -> None:
         self._providers[str(language)] = provider
 
-    def complete(self, language: str, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, language: str, text: str, cursor_offset: int, *, manual: bool = False) -> CompletionQuery | None:
         provider = self._providers.get(str(language))
         if provider is None:
             return None
-        return provider.complete(str(text), max(0, min(len(text), int(cursor_offset))))
+        position = max(0, min(len(text), int(cursor_offset)))
+        if manual and isinstance(provider, (
+            JavaCompletionProvider, CppCompletionProvider, PythonCompletionProvider,
+            JavaScriptCompletionProvider, HtmlCompletionProvider, CssCompletionProvider, CatalogCompletionProvider,
+        )):
+            return provider.complete(str(text), position, minimum_prefix=1)
+        return provider.complete(str(text), position)
 
 
 JAVA_KEYWORDS = (
@@ -385,7 +434,7 @@ CATALOG_COMPLETIONS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _java_code_context(text: str, cursor_offset: int) -> bool:
+def _java_code_context(text: str, cursor_offset: int, *, line_comments=True, template_strings=False) -> bool:
     """Return False inside Java strings, chars, line comments and block comments."""
     state = "code"
     escaped = False
@@ -400,14 +449,14 @@ def _java_code_context(text: str, cursor_offset: int) -> bool:
             if ch == "*" and nxt == "/":
                 state = "code"
                 i += 1
-        elif state in {"string", "char"}:
+        elif state in {"string", "char", "template"}:
             if escaped:
                 escaped = False
             elif ch == "\\":
                 escaped = True
-            elif (state == "string" and ch == '"') or (state == "char" and ch == "'"):
+            elif (state == "string" and ch == '"') or (state == "char" and ch == "'") or (state == "template" and ch == "`"):
                 state = "code"
-        elif ch == "/" and nxt == "/":
+        elif line_comments and ch == "/" and nxt == "/":
             state = "line_comment"
             i += 1
         elif ch == "/" and nxt == "*":
@@ -417,6 +466,8 @@ def _java_code_context(text: str, cursor_offset: int) -> bool:
             state = "string"
         elif ch == "'":
             state = "char"
+        elif template_strings and ch == "`":
+            state = "template"
         i += 1
     return state == "code"
 
@@ -464,7 +515,7 @@ def _java_import_edit(text: str, qualified_name: str) -> tuple[CompletionTextEdi
 
 
 class JavaCompletionProvider:
-    def complete(self, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, text: str, cursor_offset: int, *, minimum_prefix: int = 2) -> CompletionQuery | None:
         if not _java_code_context(text, cursor_offset):
             return None
         before = text[:cursor_offset]
@@ -498,7 +549,7 @@ class JavaCompletionProvider:
         if token_match is None:
             return None
         prefix = token_match.group(0)
-        if len(prefix) < 2:
+        if len(prefix) < minimum_prefix:
             return None
         lower_prefix = prefix.lower()
         items: list[CompletionItem] = []
@@ -577,7 +628,7 @@ def _cpp_include_edit(text: str, header: str) -> tuple[CompletionTextEdit, ...]:
 class CppCompletionProvider:
     """Type-aware, offline C++20/23 completion with safe standard includes."""
 
-    def complete(self, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, text: str, cursor_offset: int, *, minimum_prefix: int = 2) -> CompletionQuery | None:
         if not _java_code_context(text, cursor_offset):
             return None
         before = text[:cursor_offset]
@@ -613,7 +664,7 @@ class CppCompletionProvider:
         if token_match is None:
             return None
         prefix = token_match.group(0)
-        if len(prefix) < 2:
+        if len(prefix) < minimum_prefix:
             return None
         lower_prefix = prefix.casefold()
         qualified = before[:token_match.start()].endswith("std::")
@@ -720,7 +771,7 @@ def _python_symbols_and_types(text: str) -> tuple[set[str], dict[str, str]]:
 
 
 class PythonCompletionProvider:
-    def complete(self, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, text: str, cursor_offset: int, *, minimum_prefix: int = 2) -> CompletionQuery | None:
         if not _generic_code_context("Python", text, cursor_offset):
             return None
         before = text[:cursor_offset]
@@ -739,7 +790,7 @@ class PythonCompletionProvider:
         if token_match is None:
             return None
         prefix = token_match.group(0)
-        if len(prefix) < 2:
+        if len(prefix) < minimum_prefix:
             return None
         items: list[CompletionItem] = []
         for symbol in sorted(symbols, key=str.casefold):
@@ -791,7 +842,7 @@ def _javascript_symbols_and_types(text: str) -> tuple[set[str], dict[str, str]]:
 
 
 class JavaScriptCompletionProvider:
-    def complete(self, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, text: str, cursor_offset: int, *, minimum_prefix: int = 2) -> CompletionQuery | None:
         if not _generic_code_context("JavaScript", text, cursor_offset):
             return None
         before = text[:cursor_offset]
@@ -804,7 +855,7 @@ class JavaScriptCompletionProvider:
             items = tuple(CompletionItem(member, member, f"JavaScript · {receiver_type}", "member") for member in members if member.casefold().startswith(prefix.casefold()))
             return CompletionQuery(cursor_offset - len(prefix), cursor_offset, prefix, items) if items else None
         token_match = re.search(r"[A-Za-z_$][\w$]*$", before)
-        if token_match is None or len(token_match.group(0)) < 2:
+        if token_match is None or len(token_match.group(0)) < minimum_prefix:
             return None
         prefix = token_match.group(0)
         words = tuple(dict.fromkeys((*symbols, *CATALOG_COMPLETIONS["JavaScript"], "AbortController", "addEventListener", "atob", "Blob", "btoa", "clearInterval", "clearTimeout", "crypto", "CustomEvent", "Event", "EventTarget", "FormData", "Headers", "HTMLElement", "IntersectionObserver", "localStorage", "MutationObserver", "navigator", "performance", "queueMicrotask", "removeEventListener", "Request", "requestAnimationFrame", "Response", "sessionStorage", "structuredClone", "TextDecoder", "TextEncoder", "URL", "URLSearchParams", "WebSocket", "Worker")))
@@ -840,7 +891,9 @@ HTML_ATTRIBUTES = (
 
 
 class HtmlCompletionProvider:
-    def complete(self, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, text: str, cursor_offset: int, *, minimum_prefix: int = 2) -> CompletionQuery | None:
+        if not _generic_code_context("HTML", text, cursor_offset):
+            return None
         before = text[:cursor_offset]
         closing_match = re.search(r"</([A-Za-z][\w-]*)?$", before)
         if closing_match:
@@ -922,7 +975,7 @@ CSS_VALUES = {
 
 
 class CssCompletionProvider:
-    def complete(self, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, text: str, cursor_offset: int, *, minimum_prefix: int = 2) -> CompletionQuery | None:
         if not _generic_code_context("CSS", text, cursor_offset):
             return None
         before = text[:cursor_offset]
@@ -953,8 +1006,41 @@ class CssCompletionProvider:
 
 def _generic_code_context(language: str, text: str, cursor_offset: int) -> bool:
     before = text[:cursor_offset]
-    if language in {"C++", "JavaScript", "TypeScript", "C#", "PHP", "CSS", "Luau"}:
-        return _java_code_context(text, cursor_offset)
+    if language == "Python":
+        # Scan the whole prefix: a line-only quote counter offers completions
+        # inside multiline docstrings and can mistake a '#' in a string for code.
+        quote = ""
+        comment = False
+        index = 0
+        while index < len(before):
+            char = before[index]
+            if comment:
+                if char == "\n":
+                    comment = False
+            elif quote:
+                if len(quote) == 1 and char == "\n":
+                    quote = ""
+                    index += 1
+                    continue
+                if char == "\\":
+                    index += 2
+                    continue
+                if before.startswith(quote, index):
+                    index += len(quote)
+                    quote = ""
+                    continue
+            elif char == "#":
+                comment = True
+            elif char in {"'", '"'}:
+                quote = char * 3 if before.startswith(char * 3, index) else char
+                index += len(quote)
+                continue
+            index += 1
+        return not quote and not comment
+    if language in {"Java", "C++", "JavaScript", "TypeScript", "C#", "PHP", "CSS", "Luau"}:
+        return _java_code_context(
+            text, cursor_offset, line_comments=language != "CSS", template_strings=language in {"JavaScript", "TypeScript"},
+        )
     if language in {"HTML", "XML"}:
         return before.rfind("<!--") <= before.rfind("-->")
     line = before.rsplit("\n", 1)[-1]
@@ -987,7 +1073,7 @@ class CatalogCompletionProvider:
         self.language = language
         self.words = tuple(dict.fromkeys(words))
 
-    def complete(self, text: str, cursor_offset: int) -> CompletionQuery | None:
+    def complete(self, text: str, cursor_offset: int, *, minimum_prefix: int = 2) -> CompletionQuery | None:
         if not _generic_code_context(self.language, text, cursor_offset):
             return None
         before = text[:cursor_offset]
@@ -995,7 +1081,7 @@ class CatalogCompletionProvider:
         if token_match is None:
             return None
         prefix = token_match.group(0)
-        if len(prefix) < 2:
+        if len(prefix) < minimum_prefix:
             return None
         lower_prefix = prefix.casefold()
         items = [
@@ -1020,5 +1106,9 @@ for _language, _words in CATALOG_COMPLETIONS.items():
     DEFAULT_COMPLETION_REGISTRY.register(_language, CatalogCompletionProvider(_language, _words))
 
 
-def completion_query(language: str, text: str, cursor_offset: int) -> CompletionQuery | None:
-    return DEFAULT_COMPLETION_REGISTRY.complete(language, text, cursor_offset)
+def completion_context_allowed(language: str, text: str, cursor_offset: int) -> bool:
+    return _generic_code_context(language, text, max(0, min(len(text), int(cursor_offset))))
+
+
+def completion_query(language: str, text: str, cursor_offset: int, *, manual: bool = False) -> CompletionQuery | None:
+    return DEFAULT_COMPLETION_REGISTRY.complete(language, text, cursor_offset, manual=manual)

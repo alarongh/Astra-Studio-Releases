@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from typing import Callable, Iterable, Mapping
 
 
@@ -83,6 +84,20 @@ def _standard_java_homes(env: Mapping[str, str]) -> Iterable[Path]:
                     yield home
 
 
+def _macos_java_homes() -> Iterable[Path]:
+    for root in (Path("/Library/Java/JavaVirtualMachines"), Path.home() / "Library" / "Java" / "JavaVirtualMachines"):
+        try:
+            yield from sorted(root.glob("*/Contents/Home"), reverse=True)
+        except OSError:
+            continue
+    for prefix in (Path("/opt/homebrew/opt"), Path("/usr/local/opt")):
+        try:
+            for formula in sorted(prefix.glob("openjdk*"), reverse=True):
+                yield formula / "libexec" / "openjdk.jdk" / "Contents" / "Home"
+        except OSError:
+            continue
+
+
 def discover_java_runtime(
     env: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] | None = None,
@@ -99,10 +114,20 @@ def discover_java_runtime(
             candidates.append((Path(value), variable))
     candidates.extend((Path(home), "configured") for home in extra_homes)
 
+    if search_standard_homes and sys.platform == "darwin":
+        candidates.extend((home, "macOS JDK bundle") for home in _macos_java_homes())
+
     javac_on_path = which_fn("javac.exe" if os.name == "nt" else "javac") or which_fn("javac")
     java_on_path = which_fn("java.exe" if os.name == "nt" else "java") or which_fn("java")
     javac_home = _paired_home(javac_on_path)
     java_home = _paired_home(java_on_path)
+    if sys.platform == "darwin":
+        # /usr/bin/java and javac are launch stubs even without a JDK. Starting
+        # them may open an installation dialog; they do not prove availability.
+        if javac_on_path and Path(javac_on_path) == Path("/usr/bin/javac"):
+            javac_home = None
+        if java_on_path and Path(java_on_path) == Path("/usr/bin/java"):
+            java_home = None
     if javac_home is not None:
         candidates.append((javac_home, "PATH javac"))
     if java_home is not None:

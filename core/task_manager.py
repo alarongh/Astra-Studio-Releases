@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from .command_launch import configure_process_command
 import os
 import time
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
+from core.process_control import configure_process_group, request_process_stop, stop_process_and_wait
 
 
 def _decode_process_output(data: bytes, preferred_encoding: str | None = None) -> str:
@@ -70,10 +72,10 @@ class BackgroundProcessTask(QObject):
         self._started_at = time.monotonic()
         self.cancel_requested = False
         self.process = QProcess(self)
+        configure_process_group(self.process)
         if self.spec.workdir:
             self.process.setWorkingDirectory(str(self.spec.workdir))
-        self.process.setProgram(str(self.spec.program))
-        self.process.setArguments([str(arg) for arg in self.spec.arguments])
+        configure_process_command(self.process, self.spec.program, self.spec.arguments)
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONIOENCODING", "utf-8")
         for key, value in self.spec.environment.items():
@@ -112,12 +114,7 @@ class BackgroundProcessTask(QObject):
         self.cancel_requested = True
         if not self.process or self.process.state() == QProcess.ProcessState.NotRunning:
             return
-        self.process.terminate()
-        QTimer.singleShot(1600, self._force_kill_if_running)
-
-    def _force_kill_if_running(self):
-        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
-            self.process.kill()
+        request_process_stop(self.process, delay_ms=1600)
 
     def _read_stream(self, stream: str):
         if not self.process:
@@ -254,9 +251,6 @@ class TaskManager(QObject):
         task.cancel_requested = True
         process = task.process
         if process and process.state() != QProcess.ProcessState.NotRunning:
-            process.terminate()
-            if not process.waitForFinished(max(0, int(timeout_ms))):
-                process.kill()
-                process.waitForFinished(max(0, int(timeout_ms)))
+            stop_process_and_wait(process, timeout_ms)
         if self.current_task is task:
             self.current_task = None

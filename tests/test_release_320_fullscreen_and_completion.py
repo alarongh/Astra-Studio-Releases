@@ -38,7 +38,7 @@ def test_wallpaper_is_single_image_and_project_frame_is_stable():
     assert "painter.drawTiledPixmap" not in source
     assert "painter.drawPixmap(x, y, self._wallpaper_tile)" in source
     assert 'self.main_splitter.setObjectName("MainSplitter")' in source
-    assert "self.project_panel.setMinimumWidth(270)" in source
+    assert "self.project_panel.setMinimumWidth(160)" in source
     assert "self.main_splitter.setHandleWidth(8)" in source
 
 

@@ -260,4 +260,8 @@ D3 gate: `compileall` + static smoke pass; full sandbox suite collects **185 tes
 - [x] Release 3.19 laptop release candidate: adaptive settings width, project-tree yielding, fixed tiled workspace wallpaper, popup-level Tab/Space completion handling, packaged shortcut script and built-in public update fallback.
 - [x] Release 3.20 usability repair: full-page settings inside Astra, single non-repeating workspace wallpaper, stable opaque project-tree frame and expanded contextual completion for Java, Python, C++, JavaScript, HTML and CSS.
 
-**Final Integration Gate status: PASSED. Release 3.3 remains the frozen functional baseline. Owner acceptance continues on Release 3.20, which includes all earlier repairs plus transactional update recovery, the focused six-language editor, simplified full-page settings, cross-language diagnostic parity and laptop-resolution fixes; Release 4.0 planning remains blocked until 3.x owner sign-off.**
+**Final Integration Gate status: PASSED. Release 3.20 closed the 3.x stabilization cycle with transactional update recovery, the focused six-language editor, simplified full-page settings, cross-language diagnostic parity and laptop-resolution fixes.**
+
+- [x] Release 4.0 focused workspace: obsolete generated language examples are archived outside the active workspace, the tree shows the six supported languages plus neutral configuration files, project width is user-controlled, and Run becomes Stop during compilation/execution.
+
+**Current verified candidate: Release 4.0. Release 3.20 remains the previous public compatibility baseline.**
