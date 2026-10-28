@@ -30,6 +30,7 @@ def main() -> None:
     assert version_parts(info['LSMinimumSystemVersion']) <= version_parts(args.target_macos)
     assert info['CFBundleShortVersionString'] == '5.0'
     required_arches = {'arm64', 'x86_64'} if args.arch == 'universal2' else {args.arch}
+    bundled_files = [path for path in app.rglob('*') if path.is_file()]
     checked = []
     for path in sorted(app.rglob('*')):
         if not path.is_file() or path.is_symlink():
@@ -45,12 +46,30 @@ def main() -> None:
         assert versions, f'No minimum macOS metadata: {path}'
         actual = max(versions, key=version_parts)
         assert version_parts(actual) <= version_parts(args.target_macos), f'{path}: needs {actual}, target {args.target_macos}'
+        assert version_parts(actual) <= version_parts(info['LSMinimumSystemVersion']), f'Info.plist understates minimum OS for {path}: {actual}'
+        dependencies = subprocess.check_output(['otool', '-L', str(path)], text=True).splitlines()[1:]
+        for line in dependencies:
+            dependency = line.strip().split(' (', 1)[0]
+            if dependency.startswith(('/usr/lib/', '/System/Library/')):
+                continue
+            if dependency.startswith('@rpath/'):
+                suffix = '/' + dependency.removeprefix('@rpath/')
+                assert any(item.as_posix().endswith(suffix) for item in bundled_files), f'{path}: missing bundled dependency {dependency}'
+                continue
+            bases = {'@loader_path/':path.parent, '@executable_path/':app/'Contents/MacOS'}
+            for prefix, base in bases.items():
+                if dependency.startswith(prefix):
+                    target = (base/dependency.removeprefix(prefix)).resolve()
+                    assert target.is_relative_to(app) and target.is_file(), f'{path}: external/missing dependency {dependency}'
+                    break
+            else:
+                raise AssertionError(f'{path}: non-system external dependency {dependency}')
         checked.append({'path':path.relative_to(app).as_posix(), 'arch':sorted(arches), 'minimum_macos':actual})
     assert checked, 'No Mach-O binaries found'
     result = {'version':'5.0','architecture':args.arch,'target_macos':args.target_macos,'binaries':checked}
     destination = app.parent / 'compatibility.json'
     destination.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
-    print(f'PASS: {len(checked)} Mach-O files; {args.arch}; minimum OS <= {args.target_macos}')
+    print(f'PASS: {len(checked)} Mach-O files; {args.arch}; minimum OS <= {args.target_macos}; no external non-system libraries')
 
 
 if __name__ == '__main__':

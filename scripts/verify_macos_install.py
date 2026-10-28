@@ -33,7 +33,9 @@ def main() -> None:
                         pass
                     else:
                         raise RuntimeError(f'App exited during startup: {process.returncode}; '+(root/'startup.log').read_text(errors='replace'))
-                    assert (root/'clean profile'/'settings.json').is_file(), 'First-launch settings were not created'
+                    # Settings may be written only on a normal window close;
+                    # this bounded startup probe terminates the process below.
+                    assert (root/'clean profile'/'workspace'/'example.py').is_file(), 'First-launch workspace was not created'
                     print('PASS: DMG mounted, app copied, signature valid, native Cocoa startup and clean profile verified')
                 finally:
                     if process.poll() is None:

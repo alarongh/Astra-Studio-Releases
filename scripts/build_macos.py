@@ -61,6 +61,10 @@ def deployment_target(minimum_floor: str = MINIMUM_MACOS) -> str:
     if pyside is None or not pyside.origin:
         raise RuntimeError("Install requirements.txt in the current build environment first")
     binaries.append(Path(pyside.origin).parent / "Qt" / "lib" / "QtCore.framework" / "Versions" / "A" / "QtCore")
+    # Wheel tags and Qt frameworks can advertise a lower floor than the
+    # Python binding extensions. Check the modules this application bundles.
+    for module in ("QtCore", "QtGui", "QtWidgets", "QtNetwork", "QtDBus"):
+        binaries.extend(Path(pyside.origin).parent.glob(module + "*.so"))
     versions = [minimum_floor]
     for binary in binaries:
         output = subprocess.run([otool, "-l", str(binary)], check=True, text=True, capture_output=True).stdout
@@ -94,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--arch", choices=("arm64", "x86_64", "universal2"), default=platform.machine())
     parser.add_argument("--dmg", action="store_true", help="also create a DMG with an Applications shortcut")
     parser.add_argument("--codesign-identity", help="optional existing Developer ID identity; default is ad-hoc signing")
-    parser.add_argument("--target-macos", choices=("11.0", "13.0"), help="fail if the bundled runtime requires a newer macOS")
+    parser.add_argument("--target-macos", choices=("11.0", "13.0", "15.0"), help="fail if the bundled runtime requires a newer macOS")
     parser.add_argument("--variant", choices=("standard", "legacy"), default="standard")
     args = parser.parse_args(argv)
     if sys.platform != "darwin":

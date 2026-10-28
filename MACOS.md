@@ -1,6 +1,35 @@
-# macOS build and validation
+# macOS: установка Astra Studio 5.0
 
-Use macOS 13 or newer and a supported CPython with the pinned PySide6 and
+## Выбор пакета
+
+Для Intel Mac с **macOS 11.7.10** выберите `Astra-Studio-5.0-x86_64-legacy-macOS11.0.dmg`. В него входит Python 3.12 и Qt/PySide6 6.6.3.1, чей wheel рассчитан на macOS 11+. Для Intel с macOS 15+ и Apple Silicon с macOS 15+ предусмотрены отдельные `standard` пакеты на текущих зависимостях.
+
+Сверьте SHA-256, откройте DMG и перетащите `Astra Studio.app` в `Applications`. Запускайте скопированное приложение. Отдельная установка Python/pip/Homebrew для самой IDE не нужна. Интерпретаторы и компиляторы пользовательских программ устанавливаются отдельно.
+
+Перед заменой существующей Astra закройте её и сохраните прежнюю `.app`. Профиль находится в `~/Library/Application Support/AstralStudio` и не удаляется заменой `.app`.
+
+Проверка минимальной macOS охватывает **все** Mach-O файлы пакета, а не только Info.plist или QtCore. Проверяется наличие нужной архитектуры и отсутствие требований выше заявленного минимума. Это проверка бинарной совместимости; выполнение на физическом Mac с 11.7.10 остаётся отдельной приёмкой.
+
+Пакеты подписываются ad-hoc. Developer ID и notarization требуют учётной записи/сертификата издателя; без них macOS может запросить подтверждение запуска. Сборка не отключает Gatekeeper, не удаляет quarantine и не меняет настройки безопасности.
+
+## Сборка для Intel Big Sur
+
+На Intel Mac используйте CPython 3.12 и отдельное окружение:
+
+```sh
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements-macos-intel-legacy.txt -r requirements-test.txt
+.venv/bin/python -m pytest -q
+.venv/bin/python scripts/build_macos.py --arch x86_64 --variant legacy --target-macos 11.0 --dmg
+```
+
+`--target-macos` запрещает выпуск пакета, если фактические библиотеки требуют более новую ОС. Не меняйте Info.plist вручную для обхода этого ограничения. Для macOS 10.x совместимость не заявлена.
+
+Официальные требования: [PySide6 6.6.3.1](https://pypi.org/project/PySide6/6.6.3.1/), [Qt 6.11](https://doc.qt.io/qt-6.11/supported-platforms.html).
+
+## Современные сборки
+
+Use macOS 15 or newer and a supported CPython with the pinned PySide6 and
 PyInstaller versions in `requirements.txt`. Build natively on Apple Silicon
 (`arm64`) or Intel (`x86_64`); Windows cannot cross-build the `.app`.
 
@@ -11,8 +40,8 @@ python3 -m venv .venv
 .venv/bin/python scripts/build_macos.py --dmg
 ```
 
-The output is `dist/macos-<arch>/Astra Studio.app` and, with `--dmg`,
-`Astra-Studio-5.0-<arch>.dmg` in the same directory. All build resources are
+The output is `dist/macos-<arch>-standard/Astra Studio.app` and, with `--dmg`,
+`Astra-Studio-5.0-<arch>-standard-macOS<minimum>.dmg` in the same directory. All build resources are
 resolved from the script location, so invoking it from another working directory
 or a path containing spaces or Cyrillic is supported. The generated spec lives
 under ignored `build/`, and includes `assets`, `data/python_libraries.json`, and
@@ -65,8 +94,7 @@ their own machines; report those as untested unless actually exercised.
 The default package is ad-hoc signed by PyInstaller, and the build script verifies
 its signature. Distribution signing requires an owner's existing Developer ID
 identity (`--codesign-identity`). Notarization and stapling require the owner's
-Apple account credentials and are separate release steps. This change does not
-publish a release or alter the public update feed. The Windows installer/update
+Apple account credentials and are separate release steps. The Windows JSON update feed is not a macOS installer. The Windows installer/update
 pipeline remains separate; macOS packages currently require manual replacement.
 
 For an isolated acceptance run, set an absolute `ASTRA_DATA_DIR` when launching

@@ -36,18 +36,18 @@ jobs:
             target: '11.0'
             variant: legacy
           - os: macos-15-intel
-            label: Intel macOS 13+ / Python 3.14
+            label: Intel macOS 15+ / Python 3.14
             python: '3.14'
             requirements: requirements.txt
             arch: x86_64
-            target: '13.0'
+            target: '15.0'
             variant: standard
           - os: macos-latest
-            label: Apple Silicon macOS 13+ / Python 3.14
+            label: Apple Silicon macOS 15+ / Python 3.14
             python: '3.14'
             requirements: requirements.txt
             arch: arm64
-            target: '13.0'
+            target: '15.0'
             variant: standard
     env:
       PYTHONUTF8: '1'
@@ -73,8 +73,9 @@ jobs:
       - name: Compile application and tests
         run: python -m compileall -q main.py core scripts tests
       - name: Run offscreen regression tests
+        timeout-minutes: 8
         # The native HWND test is run separately with the Windows platform plugin.
-        run: python -m pytest -q -rs -k "not test_windows_native_close_command_reaches_close_event_after_topmost_toggle"
+        run: python -m pytest -v -rs -k "not test_windows_native_close_command_reaches_close_event_after_topmost_toggle"
       - name: Check native Windows caption events
         if: runner.os == 'Windows'
         env:
