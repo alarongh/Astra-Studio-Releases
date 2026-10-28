@@ -4,6 +4,8 @@ import datetime
 import html
 import json
 import keyword
+import weakref
+import shiboken6
 import os
 import py_compile
 import re
@@ -84,6 +86,7 @@ try:
         QMenu,
         QToolTip,
         QCompleter,
+        QColorDialog,
     )
 except ImportError as exc:
     print("PySide6 не установлен.")
@@ -91,6 +94,8 @@ except ImportError as exc:
     raise exc
 
 from core.task_manager import ProcessTaskSpec, TaskManager
+from core.platform_runtime import app_data_candidates, existing_app_profile, macos_tool_directories, bundle_resource_path
+from core.process_control import configure_process_group, request_process_stop, signal_process, stop_process_and_wait
 from core.lsp_transport import LspManager
 from core.lsp_protocol import uri_to_path
 from core.lsp_servers import install_plan_for_language
@@ -98,6 +103,7 @@ from core.lsp_features import (
     apply_text_edits,
     hover_text,
     normalize_completion_items,
+    completion_query_from_lsp_items,
     normalize_document_symbols,
     normalize_locations,
     normalize_workspace_edit,
@@ -105,6 +111,7 @@ from core.lsp_features import (
     workspace_edit_has_resource_operations,
 )
 from core.python_environment import detect_project_environment
+from core.python_dependencies import IMPORT_PROBE_CODE, MUTATING_PIP_ACTIONS, normalized_import_names, parse_import_probe
 from core.quality_tools import (
     QualityDiagnostic,
     formatter_command,
@@ -114,7 +121,10 @@ from core.quality_tools import (
     linter_tool_for_language,
     parse_linter_output,
 )
-from core.language_completion import CompletionItem, CompletionTextEdit, completion_query
+from core.language_completion import (
+    CompletionItem, CompletionTextEdit, completion_query, completion_edit_plan,
+    completion_context_allowed, text_offset_to_utf16, utf16_offset_to_text,
+)
 from core.java_runtime import discover_java_runtime, java_arguments, javac_arguments, java_version
 from core.project_commands import COMMAND_KEYS, detect_project_commands, merge_project_commands, normalize_commands
 from core.project_doctor import inspect_project
@@ -135,6 +145,11 @@ from core.ai_context import (
 )
 from core.project_paths import portable_attached_folders, portable_project_path
 from core.window_behavior import apply_topmost_hint
+from core.appearance import (
+    COLOR_ROLES, DEFAULT_BACKGROUND_COLOR, SOLID_COLOR_PALETTE,
+    editor_theme_with_background, ensure_contrast, load_appearance_colors,
+    normalize_hex_color, readable_text_color, restore_splitter_sizes,
+)
 from core.project_templates import (
     create_project_from_template,
     get_project_template,
@@ -461,17 +476,9 @@ CMD ["python", "main.py"]
 # It stores import-name -> pip-name mapping, categories, safety flags and bundles.
 
 
-ASTRA_WALLPAPERS = {
-    "Astra Neon Core": "assets/wallpapers/astra_neon_core.png",
-    "Astra Deep Space": "assets/wallpapers/astra_deep_space.png",
-    "Astra Classic": "assets/wallpapers/astra_blue_horizon.png",
-    "Astra Eclipse": "assets/wallpapers/astra_eclipse.png",
-    "Astra Crown Night": "assets/wallpapers/astra_crown_night.png",
-    "Astra Sakura Dusk": "assets/wallpapers/astra_sakura_dusk.png",
-    "Astra Cyber Ritual": "assets/wallpapers/astra_cyber_ritual.png",
-    "Astra Crimson Prayer": "assets/wallpapers/astra_crimson_prayer.png",
-    ANGEL_404_WALLPAPER: "assets/wallpapers/angel_404.png",
-}
+# Kept as an empty compatibility registry. Built-in photographs were retired;
+# user-selected images remain supported and are never removed by migration.
+ASTRA_WALLPAPERS = {}
 
 GLOBAL_FONT_OPTIONS = {
     DEFAULT_GLOBAL_FONT: "",
@@ -1016,14 +1023,12 @@ def _safe_mkdir(path: Path) -> Path:
 
 
 def app_data_dir() -> Path:
-    # Release 2.1: never store mutable application data near the unpacked program folder.
-    # This prevents Windows permission prompts like “request permission from another user”.
-    candidates = []
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        candidates.append(Path(local_appdata) / APP_DIR_NAME)
-    candidates.append(Path.home() / "AppData" / "Local" / APP_DIR_NAME)
-    candidates.append(Path.home() / ".astra_studio")  # legacy location from 1.x
+    # New profiles use native user-data locations. Existing profiles stay in
+    # place so their settings, internal workspace and LSP configuration survive.
+    candidates = app_data_candidates(APP_DIR_NAME)
+    existing = existing_app_profile(candidates)
+    if existing is not None:
+        return existing
     for candidate in candidates:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
@@ -1034,6 +1039,9 @@ def app_data_dir() -> Path:
 
 
 def documents_root_dir() -> Path:
+    override = os.environ.get("ASTRA_DATA_DIR")
+    if override and Path(override).is_absolute():
+        return _safe_mkdir(Path(override) / "Documents" / "Astral Studio")
     # Respect redirected/localized Windows Documents folders (OneDrive, domain
     # policies, etc.) instead of assuming %USERPROFILE%\Documents. Keep the
     # historical "Astral Studio" subfolder name for 2.x data compatibility.
@@ -1055,15 +1063,8 @@ def default_builds_dir() -> Path:
 
 
 def can_write_to_directory(path: Path) -> bool:
-    path = Path(path)
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".astral_write_test.tmp"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
-        return True
-    except OSError:
-        return False
+    from core.file_safety import directory_is_writable
+    return directory_is_writable(path, create=True)
 
 
 def project_root_dir() -> Path:
@@ -1073,10 +1074,7 @@ def project_root_dir() -> Path:
 
 
 def resource_path(relative_path: str) -> Path:
-    bundle_root = getattr(sys, "_MEIPASS", None)
-    if bundle_root:
-        return Path(bundle_root) / relative_path
-    return project_root_dir() / relative_path
+    return bundle_resource_path(relative_path, Path(__file__).resolve().parent)
 
 
 def _path_items(value: str) -> list[str]:
@@ -1103,6 +1101,15 @@ def prepend_runtime_path(folder: Path | str):
 
 
 def refresh_runtime_paths():
+    if sys.platform == "darwin":
+        # Append trusted system/user install directories only; never execute a
+        # login shell or source shell profiles merely to discover tools.
+        for folder in reversed(macos_tool_directories()):
+            prepend_runtime_path(folder)
+        runtime = discover_java_runtime()
+        if runtime is not None:
+            prepend_runtime_path(runtime.home / "bin")
+        return
     if os.name != "nt":
         return
     candidates = [
@@ -1349,6 +1356,14 @@ def project_tool_path(start: Path | str, *names: str) -> str | None:
 def python_command() -> tuple[str | None, list[str]]:
     if not getattr(sys, "frozen", False):
         return sys.executable, []
+    if os.name != "nt":
+        # A bundled executable is Astra itself, not a reusable Python CLI.
+        # python3 is the normal executable on both macOS and current Linux.
+        for name in ("python3", "python"):
+            candidate = compiler_path(name)
+            if candidate and Path(candidate).resolve() != Path(sys.executable).resolve():
+                return candidate, []
+        return None, []
     launcher = compiler_path("py.exe", "py")
     if launcher:
         return launcher, ["-3"]
@@ -1776,7 +1791,8 @@ class CodeEditor(QPlainTextEdit):
         self._builtin_completer = QCompleter(self._builtin_completion_model, self)
         self._builtin_completer.setWidget(self)
         self._builtin_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self._builtin_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        # Providers (including LSP filterText) have already filtered these rows.
+        self._builtin_completer.setCompletionMode(QCompleter.CompletionMode.UnfilteredPopupCompletion)
         self._builtin_completer.popup().setToolTip("Tab — выбрать следующий · Space — вставить выбранный")
         # QCompleter installs its own event filter on the popup.  Installing the
         # editor afterwards lets us keep Space and Tab deterministic even when
@@ -1909,6 +1925,7 @@ class CodeEditor(QPlainTextEdit):
 
     def line_number_area_paint_event(self, event):
         painter = QPainter(self.line_number_area)
+        painter.setFont(self.font())
         painter.fillRect(event.rect(), QColor(self.theme["panel"]))
         painter.setPen(QColor(self.theme["muted"]))
 
@@ -2264,19 +2281,34 @@ class CodeEditor(QPlainTextEdit):
         self._builtin_completion_timer.start()
 
     def _hide_builtin_completion(self):
+        if hasattr(self, "_builtin_completion_timer"):
+            self._builtin_completion_timer.stop()
         if hasattr(self, "_builtin_completer"):
             self._builtin_completer.popup().hide()
         self._builtin_completion_query = None
         self._builtin_completion_items = {}
+        self._builtin_completion_revision = None
+        self._builtin_completion_caret = None
         self._builtin_tab_cycle_active = False
         self._builtin_tab_cycle_index = -1
 
-    def _refresh_builtin_completion(self):
-        if not self.completion_enabled or self.hasFocus() is False:
+    def _refresh_builtin_completion(self, force=False, request_lsp=True):
+        if not self.completion_enabled or (not force and self.hasFocus() is False):
             self._hide_builtin_completion()
             return
         cursor = self.textCursor()
-        query = completion_query(self.language_name, self.toPlainText(), cursor.position())
+        text = self.toPlainText()
+        position = utf16_offset_to_text(text, cursor.position())
+        query = completion_query(self.language_name, text, position, manual=bool(force))
+        # A ready server knows project/dependency members that the offline
+        # provider cannot infer. Do not launch/install a server on each key.
+        callback = getattr(self, "_astra_completion_callback", None)
+        if (
+            request_lsp and callable(callback)
+            and completion_context_allowed(self.language_name, text, position)
+            and re.search(r"(?:[\w$-]{2,}|[.:>])\Z", text[:position])
+        ):
+            callback()
         if query is None or not query.items:
             self._hide_builtin_completion()
             return
@@ -2284,6 +2316,10 @@ class CodeEditor(QPlainTextEdit):
         if self.active_snippet and self.active_snippet.get("trigger", "").lower() == token.lower():
             self._hide_builtin_completion()
             return
+        self._show_completion_query(query)
+
+    def _show_completion_query(self, query):
+        self._builtin_completion_timer.stop()
         labels: list[str] = []
         item_map: dict[str, CompletionItem] = {}
         for item in query.items:
@@ -2297,17 +2333,26 @@ class CodeEditor(QPlainTextEdit):
             return
         self._builtin_completion_query = query
         self._builtin_completion_items = item_map
+        self._builtin_completion_revision = self.document().revision()
+        self._builtin_completion_caret = self.textCursor().position()
         self._builtin_tab_cycle_active = False
         self._builtin_tab_cycle_index = -1
         self._builtin_completion_model.setStringList(labels)
-        self._builtin_completer.setCompletionPrefix(query.prefix)
+        # LSP filterText need not match its label; filtering labels again would
+        # hide valid dependency suggestions or leave no selected first row.
+        self._builtin_completer.setCompletionPrefix("")
         popup = self._builtin_completer.popup()
+        popup.setFont(self.font())
         popup.setCurrentIndex(self._builtin_completer.completionModel().index(0, 0))
-        available_width = max(150, self.viewport().width() - 24)
-        popup_width = min(560, available_width, max(240, self.viewport().width() // 2))
+        screen = self.screen()
+        screen_width = screen.availableGeometry().width() if screen else self.viewport().width()
+        available_width = max(1, min(self.viewport().width() - 12, screen_width - 24))
+        text_width = max((popup.fontMetrics().horizontalAdvance(label) for label in labels), default=0) + 36
+        popup_width = min(available_width, max(180, min(720, text_width)))
         popup.setMinimumWidth(popup_width)
         popup.setMaximumWidth(available_width)
         self._builtin_completer.complete(self.cursorRect())
+        popup.setCurrentIndex(self._builtin_completer.completionModel().index(0, 0))
 
     def _cycle_builtin_completion(self) -> bool:
         """Select suggestions with Tab without inserting them immediately.
@@ -2350,22 +2395,28 @@ class CodeEditor(QPlainTextEdit):
         item = self._builtin_completion_items.get(str(display))
         if query is None or item is None:
             return False
-        edits = [*item.additional_edits, CompletionTextEdit(query.start, query.end, item.insert_text)]
-        cursor_offset = item.cursor_offset
-        if cursor_offset is None and item.insert_text.endswith("()"):
-            cursor_offset = len(item.insert_text) - 1
-        final_position = query.start + (len(item.insert_text) if cursor_offset is None else max(0, min(len(item.insert_text), cursor_offset)))
-        for edit in item.additional_edits:
-            if edit.start <= query.start:
-                final_position += len(edit.new_text) - (edit.end - edit.start)
+        revision = getattr(self, "_builtin_completion_revision", None)
+        if revision is not None and revision != self.document().revision():
+            self._hide_builtin_completion()
+            return False
+        caret = getattr(self, "_builtin_completion_caret", None)
+        if caret is not None and caret != self.textCursor().position():
+            self._hide_builtin_completion()
+            return False
+        text = self.toPlainText()
+        try:
+            edits, final_position = completion_edit_plan(text, query, item)
+        except ValueError:
+            self._hide_builtin_completion()
+            return False
         cursor = self.textCursor()
         cursor.beginEditBlock()
-        for edit in sorted(edits, key=lambda value: (value.start, value.end), reverse=True):
-            cursor.setPosition(edit.start)
-            cursor.setPosition(edit.end, QTextCursor.MoveMode.KeepAnchor)
+        for edit in edits:
+            cursor.setPosition(text_offset_to_utf16(text, edit.start))
+            cursor.setPosition(text_offset_to_utf16(text, edit.end), QTextCursor.MoveMode.KeepAnchor)
             cursor.insertText(edit.new_text)
         cursor.endEditBlock()
-        cursor.setPosition(final_position)
+        cursor.setPosition(text_offset_to_utf16(self.toPlainText(), final_position))
         self.setTextCursor(cursor)
         self._hide_builtin_completion()
         self.setFocus()
@@ -2602,6 +2653,7 @@ class CodeEditor(QPlainTextEdit):
         if popup is None or not popup.isVisible():
             return False
         if event.key() == Qt.Key.Key_Escape:
+            self._astra_completion_generation = getattr(self, "_astra_completion_generation", 0) + 1
             self._hide_builtin_completion()
             event.accept()
             return True
@@ -2641,9 +2693,10 @@ class CodeEditor(QPlainTextEdit):
 
     def eventFilter(self, watched, event):
         if (
+            event.type() == QEvent.Type.KeyPress
+            and
             hasattr(self, "_builtin_completer")
             and watched is self._builtin_completer.popup()
-            and event.type() == QEvent.Type.KeyPress
             and self._handle_builtin_completion_key(event)
         ):
             return True
@@ -2652,6 +2705,10 @@ class CodeEditor(QPlainTextEdit):
     def keyPressEvent(self, event):
         if self._handle_builtin_completion_key(event):
             return
+        if event.key() == Qt.Key.Key_Escape:
+            # Escape also cancels an in-flight request before any popup appears.
+            self._astra_completion_generation = getattr(self, "_astra_completion_generation", 0) + 1
+            self._builtin_completion_timer.stop()
         if event.key() == Qt.Key.Key_Escape and self.completion_hint.isVisible():
             self.dismiss_completion_hint()
             event.accept()
@@ -3178,7 +3235,9 @@ class AstraStudio(QMainWindow):
         self.format_on_save_enabled = False
         self.custom_wallpaper_path = ""
         self.preset_wallpaper_name = DEFAULT_PRESET_WALLPAPER
-        self.wallpaper_enabled = True
+        self.wallpaper_enabled = False
+        self.background_color = DEFAULT_BACKGROUND_COLOR
+        self.panel_colors = {}
         # Wallpapers belong to the writing surface only. Keeping navigation,
         # settings and the project tree opaque makes compact layouts readable.
         self.wallpaper_all_windows = False
@@ -3220,10 +3279,12 @@ class AstraStudio(QMainWindow):
         # TaskManager reserved for builds/installations. Create the manager only
         # after settings restore the actual workspace/project root. Release 3.1
         # layers document sync, diagnostics and interactive editor features on it.
+        window_ref = weakref.ref(self)
         self.lsp_manager = LspManager(
             self.data_dir / "lsp_servers.json",
             self.workspace_dir,
             self,
+            launch_guard=lambda: bool(window_ref() and window_ref()._project_tools_trusted(confirm=False)),
         )
         self.quality_diagnostics = {}
         self._queued_lsp_requests = {}
@@ -3243,14 +3304,17 @@ class AstraStudio(QMainWindow):
         self.theme["accent"] = ACCENTS[self.current_accent_name]
 
         self.setWindowTitle(f"{APP_NAME} — {APP_VERSION}")
-        self.resize(1480, 840)
-        self.setMinimumSize(760, 520)
+        available = self.screen().availableGeometry()
+        # Qt already supplies logical coordinates on Retina/high-DPI displays.
+        self.setMinimumSize(min(640, max(420, available.width() - 40)), min(480, max(300, available.height() - 60)))
+        self.resize(min(1480, available.width() - 40), min(840, available.height() - 60))
 
         self._ensure_workspace_examples()
         self._build_ui()
         self._setup_shortcuts()
         self.apply_theme()
         self._restore_saved_geometry()
+        QTimer.singleShot(0, self._restore_saved_splitters)
         self.apply_window_opacity()
         if self.always_on_top_enabled:
             QTimer.singleShot(0, self.apply_always_on_top)
@@ -3267,6 +3331,17 @@ class AstraStudio(QMainWindow):
             self.restoreGeometry(QByteArray.fromHex(self.saved_geometry_hex.encode("ascii")))
         except Exception as exc:
             self.write_exception_log("Не удалось восстановить размер окна", exc)
+
+    def _restore_saved_splitters(self):
+        if not self.save_window_sizes_enabled:
+            return
+        for name, sizes in (
+            ("root_splitter", self.saved_root_splitter_sizes or [240, 0, 1040]),
+            ("main_splitter", self.saved_main_splitter_sizes or [280, 940]),
+            ("vertical_splitter", self.saved_vertical_splitter_sizes or [570, 250]),
+        ):
+            if sizes and hasattr(self, name):
+                getattr(self, name).setSizes(sizes)
 
     def _load_global_font_family(self) -> str:
         asset = GLOBAL_FONT_OPTIONS.get(self.global_font_name, "")
@@ -3313,6 +3388,9 @@ class AstraStudio(QMainWindow):
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
+        if not isinstance(data, dict):
+            return
+        self.background_color, self.panel_colors = load_appearance_colors(data)
         theme = data.get("theme")
         accent = data.get("accent")
         language = data.get("language")
@@ -3384,8 +3462,9 @@ class AstraStudio(QMainWindow):
                 self.custom_wallpaper_path = str(wallpaper)
         if preset_wallpaper in ASTRA_WALLPAPERS:
             self.preset_wallpaper_name = preset_wallpaper
-        if isinstance(wallpaper_enabled, bool):
-            self.wallpaper_enabled = wallpaper_enabled
+        # An old built-in preset migrates to a solid color. Only a surviving,
+        # explicitly selected user image may enable the image background.
+        self.wallpaper_enabled = bool(self.custom_wallpaper_path) and wallpaper_enabled is not False
         # Do not restore the legacy full-window wallpaper mode: on laptop-sized
         # windows it reduced contrast in every navigation panel.
         self.wallpaper_all_windows = False
@@ -3437,12 +3516,9 @@ class AstraStudio(QMainWindow):
             self.save_window_sizes_enabled = save_window_sizes_enabled
         if isinstance(saved_geometry_hex, str):
             self.saved_geometry_hex = saved_geometry_hex
-        if isinstance(saved_root_splitter_sizes, list):
-            self.saved_root_splitter_sizes = saved_root_splitter_sizes
-        if isinstance(saved_main_splitter_sizes, list):
-            self.saved_main_splitter_sizes = saved_main_splitter_sizes
-        if isinstance(saved_vertical_splitter_sizes, list):
-            self.saved_vertical_splitter_sizes = saved_vertical_splitter_sizes
+        self.saved_root_splitter_sizes = restore_splitter_sizes(saved_root_splitter_sizes, 3)
+        self.saved_main_splitter_sizes = restore_splitter_sizes(saved_main_splitter_sizes, 2)
+        self.saved_vertical_splitter_sizes = restore_splitter_sizes(saved_vertical_splitter_sizes, 2)
         if isinstance(python_auto_install_enabled, bool):
             self.python_auto_install_enabled = python_auto_install_enabled
         if isinstance(python_install_always_ask, bool):
@@ -3496,6 +3572,8 @@ class AstraStudio(QMainWindow):
             "wallpaper_enabled": self.wallpaper_enabled,
             "wallpaper_dim_percent": self.wallpaper_dim_percent,
             "wallpaper_blur_px": self.wallpaper_blur_px,
+            "background_color": self.background_color,
+            "panel_colors": self.panel_colors,
             "panel_transparency_percent": self.editor_bg_transparency_percent,
             "visual_blur_percent": self.wallpaper_blur_px,
             "save_window_sizes_enabled": self.save_window_sizes_enabled,
@@ -3603,11 +3681,10 @@ class AstraStudio(QMainWindow):
         self.sidebar_scroll = QScrollArea()
         self.sidebar_scroll.setObjectName("SidebarScroll")
         self.sidebar_scroll.setWidgetResizable(True)
-        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.sidebar_scroll.setMinimumWidth(210)
-        self.sidebar_scroll.setMaximumWidth(270)
+        self.sidebar_scroll.setMinimumWidth(120)
         self.sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         self.sidebar = QFrame()
@@ -3636,16 +3713,20 @@ class AstraStudio(QMainWindow):
             self.logo.setMinimumHeight(56)
         else:
             self.logo.setText("Astra Studio")
+        self._brand_logo_pixmap = self.logo.pixmap()
+        self.logo.setWordWrap(True)
+        self.logo.setMinimumWidth(0)
         self.subtitle = QLabel("среда для кода · alaron")
         self.subtitle.setObjectName("Subtitle")
         self.subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.subtitle.setWordWrap(True)
+        self.subtitle.setMinimumWidth(0)
         logo_card_layout.addWidget(self.logo)
         logo_card_layout.addWidget(self.subtitle)
 
         self.sidebar_shell = QFrame()
         self.sidebar_shell.setObjectName("SidebarShell")
-        self.sidebar_shell.setMinimumWidth(210)
-        self.sidebar_shell.setMaximumWidth(270)
+        self.sidebar_shell.setMinimumWidth(120)
         self.sidebar_shell.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         sidebar_shell_layout = QVBoxLayout(self.sidebar_shell)
         sidebar_shell_layout.setContentsMargins(0, 0, 0, 0)
@@ -3831,6 +3912,22 @@ class AstraStudio(QMainWindow):
         self.tab_width_label.setObjectName("Muted")
         self.tab_width_label.setWordWrap(True)
 
+        self.color_target_combo = QComboBox()
+        for role, label in COLOR_ROLES.items():
+            self.color_target_combo.addItem(label, role)
+        self.color_palette_combo = QComboBox()
+        self.color_palette_combo.addItem("Готовая палитра…", "")
+        for label, color in SOLID_COLOR_PALETTE.items():
+            self.color_palette_combo.addItem(label, color)
+        self.color_hex_edit = QLineEdit()
+        self.color_hex_edit.setObjectName("AppearanceHex")
+        self.color_hex_edit.setPlaceholderText("#RRGGBB")
+        self.color_hex_edit.setMaxLength(7)
+        self.color_hex_edit.setAccessibleName("Цвет в формате HEX")
+        self.btn_apply_color = QPushButton("Применить HEX")
+        self.btn_choose_color = QPushButton("Выбрать свой цвет…")
+        self._refresh_color_controls()
+
         self.wallpaper_label = QLabel()
         self.wallpaper_label.setObjectName("MiniLabel")
         self.wallpaper_label.setWordWrap(True)
@@ -3921,7 +4018,7 @@ class AstraStudio(QMainWindow):
 
         self.project_panel = QFrame()
         self.project_panel.setObjectName("ProjectPanel")
-        self.project_panel.setMinimumWidth(240)
+        self.project_panel.setMinimumWidth(160)
         self.project_panel.setMaximumWidth(16777215)
         self.project_panel.setFrameShape(QFrame.Shape.StyledPanel)
         self.project_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
@@ -3995,13 +4092,16 @@ class AstraStudio(QMainWindow):
         editor_layout.setContentsMargins(10, 10, 10, 10)
         editor_layout.setSpacing(8)
 
-        top_bar = QHBoxLayout()
+        top_bar = QVBoxLayout()
         self.file_label = QLabel("без имени.py")
         self.file_label.setObjectName("FileLabel")
+        self.file_label.setWordWrap(True)
+        self.file_label.setMinimumWidth(0)
         self.mini_hint = QLabel("Ctrl+S сохранить  ·  Ctrl+O открыть  ·  F5 запустить  ·  Ctrl+Shift+C проверить")
         self.mini_hint.setObjectName("Muted")
+        self.mini_hint.setWordWrap(True)
+        self.mini_hint.setMinimumWidth(0)
         top_bar.addWidget(self.file_label)
-        top_bar.addStretch(1)
         top_bar.addWidget(self.mini_hint)
 
         editor_layout.addLayout(top_bar)
@@ -4181,19 +4281,19 @@ class AstraStudio(QMainWindow):
         settings_layout.addWidget(self.design_profile_label)
         settings_layout.addWidget(self.design_profile_combo)
         settings_layout.addSpacing(8)
-        wallpaper_title = QLabel("ОБОИ ИНТЕРФЕЙСА")
+        wallpaper_title = QLabel("ЦВЕТА И ФОН")
         wallpaper_title.setObjectName("SectionTitle")
-        wallpaper_hint = QLabel("Можно выбрать собственное изображение. Оно будет сохранено в настройках и использовано как фон приложения.")
+        wallpaper_hint = QLabel("Выберите область, готовый цвет или введите HEX. Цвета сохраняются автоматически. Собственные изображения можно использовать по желанию; встроенные фотографии больше не применяются.")
         wallpaper_hint.setObjectName("Muted")
         wallpaper_hint.setWordWrap(True)
         settings_layout.addWidget(wallpaper_title)
         settings_layout.addWidget(wallpaper_hint)
+        settings_layout.addWidget(self.color_target_combo)
+        settings_layout.addWidget(self.color_palette_combo)
+        settings_layout.addWidget(self.color_hex_edit)
+        settings_layout.addWidget(self.btn_apply_color)
+        settings_layout.addWidget(self.btn_choose_color)
         settings_layout.addWidget(self.wallpaper_label)
-        preset_label = QLabel("Предустановленные обои Astra")
-        preset_label.setObjectName("MiniLabel")
-        preset_label.setWordWrap(True)
-        settings_layout.addWidget(preset_label)
-        settings_layout.addWidget(self.preset_wallpaper_combo)
         settings_layout.addWidget(self.btn_choose_wallpaper)
         settings_layout.addWidget(self.btn_clear_wallpaper)
         settings_layout.addWidget(self.wallpaper_dim_label)
@@ -4203,9 +4303,9 @@ class AstraStudio(QMainWindow):
         settings_layout.addWidget(self.panel_transparency_label)
         settings_layout.addWidget(self.panel_transparency_slider)
         settings_layout.addSpacing(8)
-        settings_layout.addWidget(self.topmost_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.topmost_toggle)
         settings_layout.addSpacing(8)
-        settings_layout.addWidget(self.save_window_sizes_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.save_window_sizes_toggle)
         settings_layout.addWidget(self.btn_reset_window_sizes)
         settings_layout.addWidget(self.btn_reset_appearance)
         settings_layout.addSpacing(10)
@@ -4235,7 +4335,7 @@ class AstraStudio(QMainWindow):
         settings_layout.addWidget(self.editor_tab_size_slider)
         settings_layout.addWidget(self.editor_indent_size_label)
         settings_layout.addWidget(self.editor_indent_size_slider)
-        settings_layout.addWidget(self.editor_insert_spaces_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.editor_insert_spaces_toggle)
         settings_layout.addWidget(self.btn_reset_indents)
         settings_layout.addSpacing(8)
         fonts_title = QLabel("ШРИФТЫ")
@@ -4253,28 +4353,28 @@ class AstraStudio(QMainWindow):
         settings_layout.addWidget(self.editor_font_size_slider)
         settings_layout.addWidget(self.btn_reset_fonts)
         settings_layout.addSpacing(8)
-        settings_layout.addWidget(self.autocomplete_toggle)
-        settings_layout.addWidget(self.show_snippets_toggle)
-        settings_layout.addWidget(self.accept_tab_toggle)
-        settings_layout.addWidget(self.format_on_save_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.autocomplete_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.show_snippets_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.accept_tab_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.format_on_save_toggle)
         settings_layout.addSpacing(10)
         python_title = QLabel("PYTHON")
         python_title.setObjectName("SectionTitle")
         settings_layout.addWidget(python_title)
-        settings_layout.addWidget(self.auto_install_libs_toggle)
-        settings_layout.addWidget(self.always_ask_install_toggle)
-        settings_layout.addWidget(self.unknown_auto_install_toggle)
-        settings_layout.addWidget(self.open_install_log_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.auto_install_libs_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.always_ask_install_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.unknown_auto_install_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.open_install_log_toggle)
         settings_layout.addSpacing(10)
         build_title = QLabel("СБОРКА")
         build_title.setObjectName("SectionTitle")
         settings_layout.addWidget(build_title)
         settings_layout.addWidget(self.exe_mode_label)
         settings_layout.addWidget(self.exe_mode_combo)
-        settings_layout.addWidget(self.cpp_using_std_toggle)
+        self._add_wrapped_setting_checkbox(settings_layout, self.cpp_using_std_toggle)
         settings_layout.addStretch(1)
 
-        settings_card.setMinimumWidth(560)
+        settings_card.setMinimumWidth(0)
         settings_card.setMaximumWidth(980)
         settings_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         for label in settings_card.findChildren(QLabel):
@@ -4286,7 +4386,7 @@ class AstraStudio(QMainWindow):
         self.settings_scroll.setObjectName("PageScroll")
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         settings_canvas = QWidget()
         settings_canvas.setObjectName("SettingsCanvas")
@@ -4592,11 +4692,22 @@ class AstraStudio(QMainWindow):
 
         self.bottom_tabs = QTabWidget()
         self.bottom_tabs.setObjectName("BottomTabs")
-        self.bottom_tabs.addTab(run_console_card, "Вывод программы")
-        self.bottom_tabs.addTab(terminal_card, "Терминал")
-        self.bottom_tabs.addTab(problems_card, "Проблемы (0)")
-        self.bottom_tabs.addTab(tests_card, "Тесты")
-        self.bottom_tabs.addTab(git_card, "Git")
+
+        def add_console_page(page, label):
+            # Hidden tab controls must not impose their minimum width on the
+            # entire editor. Scroll only the page that actually needs space.
+            scroll = QScrollArea()
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            self.bottom_tabs.addTab(scroll, label)
+            return scroll
+
+        add_console_page(run_console_card, "Вывод программы")
+        add_console_page(terminal_card, "Терминал")
+        self.problems_page = add_console_page(problems_card, "Проблемы (0)")
+        self.tests_page = add_console_page(tests_card, "Тесты")
+        self.git_page = add_console_page(git_card, "Git")
 
         self.problems_tree.itemClicked.connect(self._open_problem_item)
         self.test_tree.itemDoubleClicked.connect(self._open_test_tree_item)
@@ -4688,12 +4799,18 @@ class AstraStudio(QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setObjectName("MainSplitter")
-        self.main_splitter.addWidget(self.project_panel)
+        self.project_scroll = QScrollArea()
+        self.project_scroll.setObjectName("PageScroll")
+        self.project_scroll.setWidgetResizable(True)
+        self.project_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.project_scroll.setMinimumWidth(160)
+        self.project_scroll.setWidget(self.project_panel)
+        self.main_splitter.addWidget(self.project_scroll)
         self.main_splitter.addWidget(self.workspace_surface)
         self.main_splitter.setCollapsible(0, False)
         main_sizes = list(self.saved_main_splitter_sizes) if self.saved_main_splitter_sizes and len(self.saved_main_splitter_sizes) >= 2 else [280, 940]
-        main_sizes[0] = max(260, int(main_sizes[0] or 0))
-        main_sizes[1] = max(520, int(main_sizes[1] or 0))
+        main_sizes[0] = max(160, int(main_sizes[0] or 0))
+        main_sizes[1] = max(200, int(main_sizes[1] or 0))
         self.main_splitter.setSizes(main_sizes[:2])
         self.main_splitter.setHandleWidth(8)
         self.main_splitter.setStretchFactor(0, 1)
@@ -4707,8 +4824,7 @@ class AstraStudio(QMainWindow):
 
         self.tools_drawer = QFrame()
         self.tools_drawer.setObjectName("SideToolsPanel")
-        self.tools_drawer.setMinimumWidth(310)
-        self.tools_drawer.setMaximumWidth(640)
+        self.tools_drawer.setMinimumWidth(200)
         self.tools_drawer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         drawer_layout = QVBoxLayout(self.tools_drawer)
         drawer_layout.setContentsMargins(10, 10, 10, 10)
@@ -4738,7 +4854,12 @@ class AstraStudio(QMainWindow):
         self.tools_stack.addWidget(developer_card)
 
         drawer_layout.addLayout(drawer_header)
-        drawer_layout.addWidget(self.tools_stack)
+        self.tools_scroll = QScrollArea()
+        self.tools_scroll.setObjectName("PageScroll")
+        self.tools_scroll.setWidgetResizable(True)
+        self.tools_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.tools_scroll.setWidget(self.tools_stack)
+        drawer_layout.addWidget(self.tools_scroll)
         self.btn_close_tools_drawer.raise_()
         self.tools_drawer.setVisible(False)
 
@@ -4756,12 +4877,16 @@ class AstraStudio(QMainWindow):
         settings_page_layout.setSpacing(10)
         settings_page_header = QFrame()
         settings_page_header.setObjectName("SettingsPageHeader")
-        settings_page_header_layout = QHBoxLayout(settings_page_header)
+        settings_page_header_layout = QVBoxLayout(settings_page_header)
         settings_page_header_layout.setContentsMargins(18, 10, 18, 10)
         settings_page_title = QLabel("НАСТРОЙКИ ASTRA STUDIO")
         settings_page_title.setObjectName("SectionTitle")
+        settings_page_title.setWordWrap(True)
+        settings_page_title.setMinimumWidth(0)
         settings_page_hint = QLabel("Изменения сохраняются автоматически")
         settings_page_hint.setObjectName("Muted")
+        settings_page_hint.setWordWrap(True)
+        settings_page_hint.setMinimumWidth(0)
         self.btn_close_settings_page = QPushButton("←  Вернуться в редактор")
         self.btn_close_settings_page.setObjectName("SettingsBackButton")
         self.btn_close_settings_page.setMinimumHeight(38)
@@ -4855,6 +4980,11 @@ class AstraStudio(QMainWindow):
         self.cpp_using_std_toggle.toggled.connect(self.toggle_cpp_using_namespace_std)
         self.btn_choose_wallpaper.clicked.connect(self.choose_custom_wallpaper)
         self.btn_clear_wallpaper.clicked.connect(self.clear_custom_wallpaper)
+        self.color_target_combo.currentIndexChanged.connect(self._refresh_color_controls)
+        self.color_palette_combo.currentIndexChanged.connect(self.apply_palette_color)
+        self.btn_apply_color.clicked.connect(self.apply_hex_color)
+        self.color_hex_edit.returnPressed.connect(self.apply_hex_color)
+        self.btn_choose_color.clicked.connect(self.choose_appearance_color)
         self.preset_wallpaper_combo.currentTextChanged.connect(self.change_preset_wallpaper)
         self.wallpaper_dim_slider.valueChanged.connect(self.change_wallpaper_dim)
         self.wallpaper_blur_slider.valueChanged.connect(self.change_wallpaper_blur)
@@ -4964,6 +5094,28 @@ class AstraStudio(QMainWindow):
         alpha = max(0, min(255, round(255 * max(0, min(100, alpha_percent)) / 100)))
         return f"rgba({r}, {g}, {b}, {alpha})"
 
+    def _add_wrapped_setting_checkbox(self, layout, checkbox):
+        """Qt checkboxes have no word-wrap; give their caption a wrapping label."""
+        caption = checkbox.text()
+        checkbox.setText("")
+        checkbox.setAccessibleName(caption)
+        checkbox.setToolTip(caption)
+        checkbox.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+        label = QLabel(caption)
+        label.setObjectName("SettingCheckLabel")
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setBuddy(checkbox)
+        label.setCursor(Qt.CursorShape.PointingHandCursor)
+        label.mousePressEvent = lambda event, control=checkbox: control.click()
+        row_layout.addWidget(checkbox, 0, Qt.AlignmentFlag.AlignTop)
+        row_layout.addWidget(label, 1)
+        layout.addWidget(row)
+
     def _make_percent_slider(self, label_text: str, value: int, minimum: int = 0, maximum: int = 100):
         label = QLabel(f"{label_text}: {value}%")
         label.setObjectName("MiniLabel")
@@ -4978,7 +5130,7 @@ class AstraStudio(QMainWindow):
 
     def update_font_labels(self):
         if hasattr(self, "ui_font_size_label"):
-            self.ui_font_size_label.setText(f"Размер шрифта интерфейса: {self.ui_font_size}px")
+            self.ui_font_size_label.setText(f"Размер шрифта интерфейса: {self.ui_font_size} pt")
         if hasattr(self, "editor_font_size_label"):
             self.editor_font_size_label.setText(f"Размер шрифта редактора: {self.editor_font_size} pt")
         if hasattr(self, "console_font_size_label"):
@@ -5105,6 +5257,58 @@ class AstraStudio(QMainWindow):
             alpha = max(min_alpha, alpha)
         return self._rgba(color, alpha)
 
+    def _appearance_color(self, role):
+        if role == "background":
+            return self.background_color
+        defaults = {
+            "panels": self.theme["panel"], "editor": self.theme["editor"],
+            "console": self.theme["console"], "project": self.theme["bg2"],
+            "settings": self.theme["panel"],
+        }
+        return self.panel_colors.get(role, defaults.get(role, self.background_color))
+
+    def _refresh_color_controls(self, *_args):
+        if not hasattr(self, "color_target_combo"):
+            return
+        color = self._appearance_color(self.color_target_combo.currentData() or "background")
+        self.color_hex_edit.setText(color)
+        self.color_hex_edit.setStyleSheet(f"background: {color}; color: {readable_text_color(color)}; padding: 7px;")
+        self.color_palette_combo.blockSignals(True)
+        self.color_palette_combo.setCurrentIndex(0)
+        self.color_palette_combo.blockSignals(False)
+
+    def _set_appearance_color(self, value):
+        color = normalize_hex_color(value)
+        role = self.color_target_combo.currentData() or "background"
+        if role == "background":
+            self.background_color = color
+            # Switch modes without deleting the user's selected image or file.
+            self.wallpaper_enabled = False
+        else:
+            self.panel_colors[role] = color
+        self.apply_theme()
+        self.update_wallpaper_label()
+        self._refresh_color_controls()
+        self._save_settings()
+
+    def apply_palette_color(self, *_args):
+        color = self.color_palette_combo.currentData()
+        if color:
+            self._set_appearance_color(color)
+
+    def apply_hex_color(self, *_args):
+        try:
+            self._set_appearance_color(self.color_hex_edit.text())
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 5000)
+            self.color_hex_edit.setFocus()
+
+    def choose_appearance_color(self):
+        role = self.color_target_combo.currentData() or "background"
+        color = QColorDialog.getColor(QColor(self._appearance_color(role)), self, "Цвет: " + COLOR_ROLES[role])
+        if color.isValid():
+            self._set_appearance_color(color.name())
+
     def current_wallpaper_path(self) -> Path | None:
         if not getattr(self, "wallpaper_enabled", True):
             return None
@@ -5114,12 +5318,6 @@ class AstraStudio(QMainWindow):
                 return path
             self.write_log(f"Обои недоступны: {path}. Используется серый fallback-фон.")
             return None
-        preset = ASTRA_WALLPAPERS.get(self.preset_wallpaper_name)
-        if preset:
-            path = resource_path(preset)
-            if path.exists() and path.is_file():
-                return path
-            self.write_log(f"Предустановленные обои недоступны: {path}. Используется серый fallback-фон.")
         return None
 
     def update_wallpaper_effect_labels(self):
@@ -5207,7 +5405,7 @@ class AstraStudio(QMainWindow):
         self.theme["accent"] = ACCENTS[self.current_accent_name]
 
         wallpaper_path = self.current_wallpaper_path()
-        root_bg = self.theme["bg"] if wallpaper_path is not None else FALLBACK_BACKGROUND
+        root_bg = self.background_color
         if self.wallpaper_all_windows and wallpaper_path is not None:
             panel_bg = self._panel_rgba(self.theme["panel"], self.aux_bg_transparency_percent)
             panel2_bg = self._panel_rgba(self.theme["panel2"], self.aux_bg_transparency_percent)
@@ -5229,7 +5427,29 @@ class AstraStudio(QMainWindow):
             aux_bg = self._panel_rgba(self.theme["panel"], self.aux_bg_transparency_percent)
             editor_bg = self._panel_rgba(self.theme["editor"], self.editor_bg_transparency_percent, 8)
 
-        logo_frame_bg = self._panel_rgba(self.theme["panel"], self.logo_frame_transparency_percent, 0)
+        # Explicit custom colors are solid: transparency would make their
+        # contrast depend on the photograph behind the widget.
+        if "panels" in self.panel_colors:
+            panel_bg = panel2_bg = bg2_bg = aux_bg = self.panel_colors["panels"]
+        if "editor" in self.panel_colors:
+            editor_bg = self.panel_colors["editor"]
+        if "console" in self.panel_colors:
+            console_bg = self.panel_colors["console"]
+        if "project" in self.panel_colors:
+            project_bg = project_tree_bg = self.panel_colors["project"]
+        if "settings" in self.panel_colors:
+            settings_bg = self.panel_colors["settings"]
+        self.editor_theme = (
+            editor_theme_with_background(self.theme, self.panel_colors["editor"])
+            if "editor" in self.panel_colors else dict(self.theme)
+        )
+        editor_text = self.editor_theme["text"]
+        editor_selection = self.editor_theme["selection"]
+        editor_selection_text = ensure_contrast(editor_text, editor_selection)
+        console_text = ensure_contrast(self.theme["text"], self._appearance_color("console"))
+        project_text = ensure_contrast(self.theme["text"], self._appearance_color("project"))
+        selection_text = ensure_contrast(self.theme["text"], self.theme["selection"])
+        logo_frame_bg = self.panel_colors.get("panels", self._panel_rgba(self.theme["panel"], self.logo_frame_transparency_percent, 0))
         logo_frame_border = self._rgba(self.theme["accent"], max(24, min(85, 42 + self.logo_frame_blur_percent // 3)))
         logo_frame_extra_border = self._rgba("#FFFFFF", max(6, min(24, self.logo_frame_blur_percent // 4)))
 
@@ -5250,7 +5470,7 @@ class AstraStudio(QMainWindow):
             app.setFont(app_font)
 
         for editor in self.all_editors():
-            editor.set_theme(self.theme)
+            editor.set_theme(self.editor_theme)
 
         self.update_background_wallpaper()
 
@@ -5265,7 +5485,7 @@ class AstraStudio(QMainWindow):
         QWidget {{
             color: {self.theme['text']};
             font-family: {ui_font_css};
-            font-size: {ui_font}px;
+            font-size: {ui_font}pt;
         }}
         QScrollArea#SidebarScroll, QScrollArea#PageScroll {{
             background: transparent;
@@ -5327,24 +5547,24 @@ class AstraStudio(QMainWindow):
         }}
         QLabel#Logo {{
             color: {self.theme['text']};
-            font-size: {logo_font}px;
+            font-size: {logo_font}pt;
             font-weight: 900;
             letter-spacing: 1px;
         }}
         QLabel#Subtitle {{
             color: {self.theme['muted']};
-            font-size: {mini_font}px;
+            font-size: {mini_font}pt;
             letter-spacing: 2px;
         }}
         QLabel#SectionTitle {{
             color: {self.theme['accent']};
-            font-size: {mini_font}px;
+            font-size: {mini_font}pt;
             font-weight: 800;
             letter-spacing: 2px;
         }}
         QLabel#MiniLabel {{
             color: {self.theme['muted']};
-            font-size: {mini_font}px;
+            font-size: {mini_font}pt;
             font-weight: 700;
             margin-top: 8px;
         }}
@@ -5357,7 +5577,7 @@ class AstraStudio(QMainWindow):
         }}
         QLabel#FileLabel {{
             color: {self.theme['text']};
-            font-size: {file_font}px;
+            font-size: {file_font}pt;
             font-weight: 800;
         }}
         QLabel#Muted, QLabel#InfoText, QLabel#MiniLabel {{
@@ -5366,12 +5586,12 @@ class AstraStudio(QMainWindow):
         }}
         QLabel#DevTitle {{
             color: {self.theme['accent']};
-            font-size: {dev_title_font}px;
+            font-size: {dev_title_font}pt;
             font-weight: 900;
         }}
         QLabel#DevText {{
             color: {self.theme['text']};
-            font-size: {file_font}px;
+            font-size: {file_font}pt;
             line-height: 150%;
         }}
         QLabel#WallpaperPreview {{
@@ -5417,7 +5637,7 @@ class AstraStudio(QMainWindow):
             padding: 0;
             text-align: center;
             font-weight: 900;
-            font-size: {close_font}px;
+            font-size: {close_font}pt;
         }}
         QPushButton#CloseButton:hover {{
             border-color: {self.theme['accent']};
@@ -5499,14 +5719,15 @@ class AstraStudio(QMainWindow):
         }}
         QPlainTextEdit#Editor {{
             background: {editor_bg};
-            color: {self.theme['text']};
+            color: {editor_text};
             font-family: {code_font_css};
             font-size: {editor_font}pt;
             letter-spacing: 0px;
             border: 0;
             border-radius: 12px;
             padding: 10px;
-            selection-background-color: {self.theme['selection']};
+            selection-background-color: {editor_selection};
+            selection-color: {editor_selection_text};
         }}
         QProgressBar#ProgressBar {{
             min-height: 24px;
@@ -5523,7 +5744,7 @@ class AstraStudio(QMainWindow):
         }}
         QPlainTextEdit#Console {{
             background: {console_bg};
-            color: {self.theme['text']};
+            color: {console_text};
             font-family: {code_font_css};
             font-size: {console_font}pt;
             letter-spacing: 0px;
@@ -5531,6 +5752,7 @@ class AstraStudio(QMainWindow):
             border-radius: 14px;
             padding: 10px;
             selection-background-color: {self.theme['selection']};
+            selection-color: {selection_text};
         }}
         QLineEdit#ConsoleInput {{
             background: {self.theme['bg2']};
@@ -5544,7 +5766,7 @@ class AstraStudio(QMainWindow):
         }}
         QTreeWidget#ProjectTree, QTreeView#ProjectTree, QTreeWidget#ProblemsTree, QTreeWidget#TestExplorerTree, QTreeWidget#GitTree {{
             background: {project_tree_bg};
-            color: {self.theme['text']};
+            color: {project_text};
             border: 1px solid {self.theme['border']};
             border-radius: 13px;
             padding: 6px;
@@ -5601,7 +5823,57 @@ class AstraStudio(QMainWindow):
             height: 0px;
         }}
         """
+        for role, containers in {
+            "panels": ("QFrame#Sidebar", "QFrame#LogoCard", "QFrame#LanguageCard", "QFrame#Card", "QFrame#ConsoleCard", "QFrame#SideToolsPanel"),
+            "project": ("QFrame#ProjectPanel",),
+            "settings": ("QWidget#PageCard", "QFrame#SettingsPageHeader"),
+        }.items():
+            if role not in self.panel_colors:
+                continue
+            color = self.panel_colors[role]
+            text = readable_text_color(color)
+            for container in containers:
+                qss += f"\n{container} QLabel, {container} QCheckBox, {container} QPushButton {{ color: {text}; }}"
+                qss += f"\n{container} QPushButton:hover {{ background: {self.theme['bg2']}; color: {self.theme['text']}; }}"
+        qss += f"\nQWidget#WorkspaceSurface {{ background: {self.background_color}; }}"
+        qss += f"\nQScrollArea#SidebarScroll QFrame#Sidebar {{ background: {panel_bg}; }}"
+        qss += f"\nQScrollArea#PageScroll QFrame#ProjectPanel {{ background: {project_bg}; }}"
+        if "panels" in self.panel_colors and hasattr(self, "logo"):
+            self.logo.setText(APP_NAME)
+            self.logo.setStyleSheet(f'font-size: {ui_font + 4}pt; color: {readable_text_color(self.panel_colors["panels"])};')
+            self.logo.ensurePolished()
+            self.logo.setMinimumHeight(max(56, 2 * self.logo.fontMetrics().lineSpacing()))
+            self.logo_card.setMinimumHeight(self.logo.minimumHeight() + self.subtitle.sizeHint().height() + 28)
+        elif hasattr(self, "_brand_logo_pixmap") and not self._brand_logo_pixmap.isNull():
+            self.logo.setPixmap(self._brand_logo_pixmap)
+            self.logo.setStyleSheet("")
+            self.logo.setMinimumHeight(56)
+            self.logo_card.setMinimumHeight(88)
         self.setStyleSheet(qss)
+        self._apply_control_metrics()
+
+    def _apply_control_metrics(self):
+        """Size controls from their actual Qt font, in logical coordinates."""
+        for button in self.findChildren(QPushButton):
+            button.ensurePolished()
+            if button.objectName() == "CloseButton":
+                button.setMaximumSize(16777215, 16777215)
+                button.setMinimumWidth(max(34, button.fontMetrics().horizontalAdvance(button.text()) + 16))
+            button.setMinimumHeight(max(32, button.fontMetrics().height() + 20))
+        if hasattr(self, "sidebar"):
+            required = max((b.fontMetrics().horizontalAdvance(b.text()) + 54 for b in self.sidebar.findChildren(QPushButton)), default=210)
+            self.sidebar.setMinimumWidth(max(210, required))
+        if hasattr(self, "project_panel"):
+            single = max((b.sizeHint().width() for b in self.project_panel.findChildren(QPushButton)), default=200)
+            pair = max((first.sizeHint().width() + second.sizeHint().width() + 8 for first, second in (
+                (self.btn_project_run, self.btn_project_build),
+                (self.btn_project_test, self.btn_project_install),
+                (self.btn_create_project, self.btn_open_project),
+                (self.btn_add_project_folder, self.btn_refresh_project),
+                (self.btn_new_project_folder, self.btn_open_project_folder),
+                (self.btn_project_search, self.btn_project_doctor),
+            )), default=200)
+            self.project_panel.setMinimumWidth(max(single, pair) + 24)
 
     def _wallpaper_qss(self) -> str:
         if hasattr(self, "background_label"):
@@ -5619,11 +5891,11 @@ class AstraStudio(QMainWindow):
         if not hasattr(self, "wallpaper_label"):
             return
         if not self.wallpaper_enabled:
-            self.wallpaper_label.setText("Обои отключены · используется серый фон")
+            self.wallpaper_label.setText("Однотонный фон: " + self.background_color)
         elif self.custom_wallpaper_path:
             self.wallpaper_label.setText("Текущие обои: пользовательские · " + Path(self.custom_wallpaper_path).name)
         else:
-            self.wallpaper_label.setText("Текущие обои Astra: " + self.preset_wallpaper_name)
+            self.wallpaper_label.setText("Однотонный фон: " + self.background_color)
 
     def update_wallpaper_preview(self):
         # Release 2.1: крупный предпросмотр обоев удалён из настроек ради адаптивности.
@@ -5644,6 +5916,10 @@ class AstraStudio(QMainWindow):
             wallpapers_dir = self.data_dir / "wallpapers"
             wallpapers_dir.mkdir(parents=True, exist_ok=True)
             target = wallpapers_dir / source.name
+            suffix = 1
+            while target.exists() and target.resolve() != source.resolve():
+                target = wallpapers_dir / f"{source.stem} ({suffix}){source.suffix}"
+                suffix += 1
             if target.resolve() != source.resolve():
                 shutil.copy2(source, target)
             self.custom_wallpaper_path = str(target)
@@ -5662,8 +5938,8 @@ class AstraStudio(QMainWindow):
         self.update_wallpaper_label()
         self.apply_theme()
         self._save_settings()
-        self.write_log("Обои отключены пользователем. Включён серый fallback-фон.")
-        self.statusBar().showMessage("Обои отключены · включён серый фон", 2200)
+        self.write_log("Пользовательский фон отключён; выбран однотонный цвет " + self.background_color)
+        self.statusBar().showMessage("Однотонный фон: " + self.background_color, 2200)
 
     def apply_window_opacity(self):
         # Whole-window opacity was removed from the user settings: it reduced
@@ -5803,7 +6079,7 @@ class AstraStudio(QMainWindow):
         path = Path(file_path) if file_path else None
         language = language_name or infer_language_from_path(path, self.current_language_name)
         editor = CodeEditor(
-            self.theme,
+            getattr(self, "editor_theme", self.theme),
             language,
             font_point_size=self.editor_font_size,
             font_family=self._selected_custom_font_family(),
@@ -5824,6 +6100,7 @@ class AstraStudio(QMainWindow):
         lsp_change_timer.timeout.connect(lambda ed=editor: self._sync_editor_lsp_change(ed))
         editor._astra_lsp_change_timer = lsp_change_timer
         editor.textChanged.connect(lambda ed=editor: self._schedule_editor_lsp_change(ed))
+        editor._astra_completion_callback = lambda ed=editor: self._request_automatic_lsp_completion(ed)
 
         index = self.tabs.addTab(editor, self.tab_title_for_editor(editor))
         self.tabs.setCurrentIndex(index)
@@ -6008,6 +6285,9 @@ class AstraStudio(QMainWindow):
         return Path(self.project_main_folder) / editor.untitled_name
 
     def _quality_python_executable(self, source_path: Path) -> str | None:
+        root = self._python_project_root(source_path)
+        if not detect_project_environment(root).python_executable and not self._resolved_project_python_override(root):
+            return None
         program, prefix = self._active_python_command(source_path)
         # A project venv resolves to a direct python executable. The Windows py
         # launcher may include -3; it is still usable for explicit installation,
@@ -6017,8 +6297,10 @@ class AstraStudio(QMainWindow):
         return str(program) if program else None
 
     def _offer_quality_tool_install(self, tool_id: str, source_path: Path) -> bool:
-        refresh_runtime_paths()
         root = self._project_root_for_source(source_path)
+        if not self._project_tools_trusted(confirm=True, root=root):
+            return False
+        refresh_runtime_paths()
         python_executable = self._quality_python_executable(source_path)
         plan = install_plan_for_quality_tool(tool_id, root, python_executable)
         if plan is None:
@@ -6032,6 +6314,8 @@ class AstraStudio(QMainWindow):
             QMessageBox.information(self, "Качество кода", f"Инструмент {tool_id} не найден.\n\n{hints.get(tool_id, 'Установи инструмент вручную и повтори операцию.')}")
             return False
         program, args = self._wrap_windows_command_script(plan.program, list(plan.arguments))
+        if not program:
+            return False
         answer = QMessageBox.question(
             self,
             "Установить инструмент качества",
@@ -6066,6 +6350,9 @@ class AstraStudio(QMainWindow):
         editor = self.current_editor()
         if not isinstance(editor, CodeEditor):
             return False
+        if not self._project_tools_trusted(confirm=not silent_if_unavailable,
+                                           root=self._project_root_for_source(self._quality_path_for_editor(editor))):
+            return False
         if self.task_manager.has_active_task():
             if not silent_if_unavailable:
                 self.statusBar().showMessage("Форматирование недоступно: уже выполняется другая задача", 3000)
@@ -6084,6 +6371,8 @@ class AstraStudio(QMainWindow):
                 QMessageBox.information(self, "Форматирование", f"Для {editor.language_name} в {APP_VERSION} пока не настроен безопасный formatter.")
             return False
         program, args = self._wrap_windows_command_script(command.program, list(command.arguments))
+        if not program:
+            return False
         context = {
             "mode": "quality_format",
             "tool_id": command.tool_id,
@@ -6118,6 +6407,9 @@ class AstraStudio(QMainWindow):
         editor = self.current_editor()
         if not isinstance(editor, CodeEditor):
             return False
+        if not self._project_tools_trusted(confirm=True,
+                                           root=self._project_root_for_source(self._quality_path_for_editor(editor))):
+            return False
         if editor.file_path is None:
             QMessageBox.information(self, "Lint", "Сначала сохрани файл: Problems должны ссылаться на реальный путь проекта.")
             return False
@@ -6137,6 +6429,8 @@ class AstraStudio(QMainWindow):
                 QMessageBox.information(self, "Lint", f"Для {editor.language_name} в {APP_VERSION} пока не настроен отдельный linter.")
             return False
         program, args = self._wrap_windows_command_script(command.program, list(command.arguments))
+        if not program:
+            return False
         context = {
             "mode": "quality_lint",
             "tool_id": command.tool_id,
@@ -6374,6 +6668,17 @@ class AstraStudio(QMainWindow):
 
     def _on_task_output(self, task_id: str, text: str, stream: str):
         context = self.active_task_context if self.active_task_context.get("task_id") == task_id else {}
+        if context.get("mode") == "python_import_probe":
+            key = "stdout_chunks" if stream == "stdout" else "stderr_chunks"
+            chunks = context.setdefault(key, [])
+            remaining = max(0, 128 * 1024 - sum(len(part) for part in chunks))
+            if remaining:
+                chunks.append(text[:remaining])
+            if len(text) > remaining and not context.get("probe_output_overflow"):
+                context["probe_output_overflow"] = True
+                self.output_console.appendPlainText("\n⚠ Python вернул слишком большой ответ. Проверка остановлена; автоустановка не выполнялась.")
+                self.task_manager.cancel_current_task()
+            return
         if context.get("mode") == "compile" and context.get("language") in {"Python", "Java", "C++", "JavaScript"}:
             key = "stdout_chunks" if stream == "stdout" else "stderr_chunks"
             context.setdefault(key, []).append(text)
@@ -6417,6 +6722,10 @@ class AstraStudio(QMainWindow):
 
     def _on_task_failed(self, task_id: str, message: str):
         context = self.active_task_context if self.active_task_context.get("task_id") == task_id else {}
+        if context.get("mode") == "python_import_probe":
+            self._stop_python_import_probe_timer(context)
+        if context.get("mode") == "python_env_create":
+            self._python_after_env_create = None
         if context.get("run_after"):
             self._set_run_button_running(False)
         if context.get("mode") == "compile" and context.get("language") == "Java":
@@ -6454,6 +6763,10 @@ class AstraStudio(QMainWindow):
         success = exit_code == 0 and not cancelled
 
         if cancelled:
+            if mode == "python_import_probe":
+                self._stop_python_import_probe_timer(context)
+            if mode == "python_env_create":
+                self._python_after_env_create = None
             self._append_task_text(task_id, "\n■ Операция отменена пользователем.\n", "stdout")
             if target == "installer":
                 self.set_progress(max(1, self.install_progress_bar.value()), "Операция отменена")
@@ -6461,6 +6774,13 @@ class AstraStudio(QMainWindow):
             if context.get("run_after"):
                 self._set_run_button_running(False)
             self.active_task_context = {}
+            return
+
+        if mode == "python_import_probe":
+            self._stop_python_import_probe_timer(context)
+            self._finish_task_ui(success, False)
+            self.active_task_context = {}
+            self._complete_python_import_probe(context, success)
             return
 
         if mode == "compile":
@@ -6558,24 +6878,21 @@ class AstraStudio(QMainWindow):
         elif mode == "pip":
             package = context.get("package", "пакет")
             if success:
-                self.output_console.appendPlainText(f"\n✓ Команда pip завершена успешно: {package}")
+                self.output_console.appendPlainText(f"\n✓ Команда менеджера пакетов завершена успешно: {package}")
+                self.library_status_cache = {}
                 self.populate_library_table()
-                import_names = [name for name in (context.get("import_names") or ([context.get("import_name")] if context.get("import_name") else [])) if name]
-                import_status = self._python_import_status_map(import_names) if import_names else {}
-                failed_imports = [name for name in import_names if not import_status.get(name, False)]
-                if failed_imports:
-                    QMessageBox.warning(self, "Python-библиотеки", "Пакет установлен, но проверка import пока не прошла для: " + ", ".join(failed_imports) + ". Перезапусти Astra Studio или проверь окружение Python.")
-                else:
-                    self.output_console.appendPlainText("✓ Проверка import после установки прошла успешно.")
-                if context.get("rerun_after") and not failed_imports:
-                    answer = QMessageBox.question(self, "Python-библиотеки", "Библиотека установлена. Запустить программу снова?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes)
-                    if answer == QMessageBox.StandardButton.Yes:
-                        self._finish_task_ui(True, False)
-                        self.active_task_context = {}
-                        self.run_code()
-                        return
+                import_names = normalized_import_names(context.get("import_names") or ([context.get("import_name")] if context.get("import_name") else []))
+                if import_names:
+                    self._finish_task_ui(True, False)
+                    self.active_task_context = {}
+                    source_path = Path(context["source_path"]) if context.get("source_path") else None
+                    if context.get("environment_key") == self._python_dependency_key(source_path):
+                        self._start_python_import_probe(import_names, "pip", source_path, resume=context)
+                    else:
+                        self.output_console.appendPlainText("\nℹ Окружение изменилось. Установка завершена в исходном окружении; проверь его вручную.")
+                    return
             else:
-                self.output_console.appendPlainText(f"\n✕ pip завершился с кодом {exit_code}")
+                self.output_console.appendPlainText(f"\n✕ Менеджер пакетов завершился с кодом {exit_code}. Проверь интернет и лог; повторная установка возможна вручную.")
         elif mode == "project_command":
             kind = context.get("kind", "command")
             if success:
@@ -6679,13 +6996,20 @@ class AstraStudio(QMainWindow):
                 }
                 self.output_console.appendPlainText("\n✓ " + labels.get(mode, "Python-операция завершена"))
                 if mode == "python_env_create":
-                    # Creating a project .venv is an explicit request to use that
-                    # environment. Drop a previous manual override so the new .venv
-                    # becomes the active project interpreter immediately.
-                    self.project_python_interpreter = ""
-                    self._save_current_project_state()
+                    created = detect_project_environment(Path(context.get("root") or self._python_project_root()))
+                    if not created.python_executable:
+                        success = False
+                        self.output_console.appendPlainText("\n⚠ Окружение не содержит Python. Создание не подтверждено; повтори операцию.")
+                    else:
+                        self.project_python_interpreter = ""
+                        self._save_current_project_state()
             else:
-                self.output_console.appendPlainText(f"\n✕ Python-операция завершилась с кодом {exit_code}")
+                self.output_console.appendPlainText(f"\n✕ Python-операция завершилась с кодом {exit_code}. Частичные файлы сохранены; можно повторить создание без удаления пользовательских файлов.")
+            if mode == "python_env_create":
+                pending = getattr(self, "_python_after_env_create", None)
+                self._python_after_env_create = None
+                if success and pending and pending[3] == str(self.project_main_folder) and pending[0] == str(self._python_project_root(pending[2])) and callable(pending[1]):
+                    QTimer.singleShot(0, pending[1])
             self._refresh_python_environment_status()
         elif mode == "quality_format":
             accepted = {int(value) for value in context.get("accepted_exit_codes", [0])}
@@ -6913,12 +7237,16 @@ class AstraStudio(QMainWindow):
         self.output_console.appendPlainText(f"Язык: {language}\nПапка проекта: {source_path.parent}\n")
 
         if language == "Python":
+            root = self._python_project_root(source_path)
+            project_interpreter = detect_project_environment(root).python_executable or self._resolved_project_python_override(root)
+            if project_interpreter and not self._project_tools_trusted(confirm=True, root=root):
+                return False
             py_program, py_args = self._active_python_command(source_path)
             if not py_program:
                 self.output_console.appendPlainText("✕ Не найден Python-интерпретатор. Открой «Установщик» и нажми «Установить Python».")
                 self._ask_install_now("Python")
                 return False
-            args = [*py_args, "-m", "py_compile", str(source_path)]
+            args = [*py_args, "-I", "-S", "-m", "py_compile", str(source_path)]
             self.output_console.appendPlainText("Этапы: подготовка → проверка синтаксиса → завершение\n")
             self.output_console.appendPlainText(f"▶ Команда: {self._safe_command_preview(py_program, args)}\n")
             self._start_process_task("compile_python", "Идёт проверка Python…", py_program, args, source_path.parent, {"mode": "compile", "language": language, "source_path": str(source_path), "tool_path": str(py_program), "indeterminate": False, "stdout_chunks": [], "stderr_chunks": []}, 5, 100, False)
@@ -6989,8 +7317,8 @@ class AstraStudio(QMainWindow):
                 self.output_console.appendPlainText("✕ PowerShell не найден.")
                 self.status_pill.setText("нет PowerShell")
                 return False
-            command = "& { param([string]$p) $null = [scriptblock]::Create([IO.File]::ReadAllText($p)); Write-Output 'PowerShell syntax OK' }"
-            args = ["-NoProfile", "-Command", command, str(source_path)]
+            from core.command_launch import powershell_syntax_arguments
+            args = powershell_syntax_arguments(source_path)
             self._start_process_task("compile_powershell", "Идёт проверка PowerShell…", ps, args, source_path.parent, {"mode": "compile", "language": language, "source_path": str(source_path), "indeterminate": False}, 10, 100, False)
             return None
         if language == "Shell":
@@ -7361,22 +7689,40 @@ class AstraStudio(QMainWindow):
     def _start_process(self, program, arguments, workdir, output_encoding=None):
         self._set_run_button_running(True)
         self.run_process = QProcess(self)
+        configure_process_group(self.run_process)
         self.run_process.setWorkingDirectory(str(workdir))
-        self.run_process.setProgram(str(program))
-        self.run_process.setArguments([str(arg) for arg in arguments])
+        from core.command_launch import configure_process_command
+        configure_process_command(self.run_process, program, arguments)
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONIOENCODING", "utf-8")
         self.run_process.setProcessEnvironment(env)
         self.run_output_encoding = output_encoding
         self.run_stderr_buffer = ""
-        self.run_process.readyReadStandardOutput.connect(self._read_run_stdout)
-        self.run_process.readyReadStandardError.connect(self._read_run_stderr)
-        self.run_process.errorOccurred.connect(lambda _error: self._run_process_start_failed(program))
-        self.run_process.finished.connect(self._run_process_finished)
+        process = self.run_process
+        owner_ref = weakref.ref(self)
+        process_ref = weakref.ref(process)
+
+        def dispatch(method, *args):
+            # Qt owns the child. Holding its parent strongly in a child callback
+            # can destroy the parent reentrantly during DeferredDelete.
+            owner = owner_ref()
+            target = process_ref()
+            if owner is not None and target is not None and shiboken6.isValid(owner) and shiboken6.isValid(target):
+                getattr(owner, method)(*args, target)
+
+        process.readyReadStandardOutput.connect(lambda: dispatch("_read_run_stdout"))
+        process.readyReadStandardError.connect(lambda: dispatch("_read_run_stderr"))
+        process.errorOccurred.connect(
+            lambda error: dispatch("_run_process_start_failed", program)
+            if error == QProcess.ProcessError.FailedToStart else None
+        )
+        process.finished.connect(lambda code, status: dispatch("_run_process_finished", code, status))
         self.output_console.appendPlainText(f"▶ Команда: {self._safe_command_preview(str(program), arguments)}\n")
         self.run_process.start()
 
-    def _run_process_start_failed(self, program):
+    def _run_process_start_failed(self, program, process=None):
+        if process is not None and process is not self.run_process:
+            return
         self._set_run_button_running(False)
         if self.last_run_language == "Java":
             self.output_console.appendPlainText(f"✕ Java runtime найден, но процесс запуска не стартовал: {program}")
@@ -7390,22 +7736,33 @@ class AstraStudio(QMainWindow):
         self.output_console.insertPlainText(text)
         self.output_console.ensureCursorVisible()
 
-    def _read_run_stdout(self):
+    def _read_run_stdout(self, process=None):
+        if process is not None and process is not self.run_process:
+            return
+        process = self.run_process if process is None else process
         data = _decode_process_output(
-            self.run_process.readAllStandardOutput().data(), getattr(self, "run_output_encoding", None)
+            process.readAllStandardOutput().data(), getattr(self, "run_output_encoding", None)
         )
         self._append_to_output(data)
 
-    def _read_run_stderr(self):
+    def _read_run_stderr(self, process=None):
+        if process is not None and process is not self.run_process:
+            return
+        process = self.run_process if process is None else process
         data = _decode_process_output(
-            self.run_process.readAllStandardError().data(), getattr(self, "run_output_encoding", None)
+            process.readAllStandardError().data(), getattr(self, "run_output_encoding", None)
         )
         if self.last_run_language == "Python":
             self._detect_missing_python_module(data)
         self.run_stderr_buffer = str(getattr(self, "run_stderr_buffer", "")) + data
         self._append_to_output(data)
 
-    def _run_process_finished(self, exit_code, _exit_status):
+    def _run_process_finished(self, exit_code, _exit_status, process=None):
+        if process is not None and process is not self.run_process:
+            return
+        # QProcess may deliver finished before the last readyRead notification.
+        self._read_run_stdout()
+        self._read_run_stderr()
         self._set_run_button_running(False)
         self.output_console.appendPlainText(f"\n\n■ Процесс завершён с кодом {exit_code}")
         if self.last_run_language == "Java":
@@ -7446,8 +7803,7 @@ class AstraStudio(QMainWindow):
 
     def stop_run_process(self):
         if self.run_process and self.run_process.state() != QProcess.ProcessState.NotRunning:
-            self.run_process.terminate()
-            QTimer.singleShot(1200, lambda: self.run_process.kill() if self.run_process and self.run_process.state() != QProcess.ProcessState.NotRunning else None)
+            request_process_stop(self.run_process)
             self.output_console.appendPlainText("\n■ Процесс остановлен пользователем.")
             self.status_pill.setText("остановлено")
         elif self.task_manager.has_active_task():
@@ -7473,6 +7829,7 @@ class AstraStudio(QMainWindow):
             return
 
         self.terminal_process = QProcess(self)
+        configure_process_group(self.terminal_process)
         self.terminal_process.setWorkingDirectory(str(self.workspace_dir))
         if os.name == "nt":
             self.terminal_process.setProgram("cmd.exe")
@@ -7497,7 +7854,7 @@ class AstraStudio(QMainWindow):
 
     def restart_terminal(self):
         if self.terminal_process and self.terminal_process.state() != QProcess.ProcessState.NotRunning:
-            self.terminal_process.kill()
+            signal_process(self.terminal_process, force=True)
             self.terminal_process.waitForFinished(1000)
         self.terminal_console.clear()
         self.start_terminal()
@@ -7543,10 +7900,10 @@ class AstraStudio(QMainWindow):
         if hasattr(self, "root_splitter"):
             sizes = self.root_splitter.sizes()
             if len(sizes) >= 3 and sizes[1] < 220:
-                total = max(self.root_splitter.width(), sum(sizes), 760)
-                sidebar_width = min(240, max(210, sizes[0] or 220))
-                drawer_width = min(390, max(310, total // 3))
-                self.root_splitter.setSizes([sidebar_width, drawer_width, max(280, total - sidebar_width - drawer_width)])
+                total = max(self.root_splitter.width(), sum(sizes), 480)
+                sidebar_width = sizes[0]
+                drawer_width = max(200, min(390, total // 3, total - sidebar_width - 320))
+                self.root_splitter.setSizes([sidebar_width, drawer_width, max(320, total - sidebar_width - drawer_width)])
         if hasattr(self, "tools_drawer_title"):
             self.tools_drawer_title.setText(title)
         if hasattr(self, "btn_close_tools_drawer"):
@@ -7571,6 +7928,9 @@ class AstraStudio(QMainWindow):
         self.global_font_name = DEFAULT_GLOBAL_FONT
         self.preset_wallpaper_name = DEFAULT_PRESET_WALLPAPER
         self.custom_wallpaper_path = ""
+        self.background_color = DEFAULT_BACKGROUND_COLOR
+        self.panel_colors = {}
+        self.wallpaper_enabled = False
         self.wallpaper_all_windows = False
         self.disable_console_wallpaper = False
         self.wallpaper_dim_percent = 55
@@ -7606,6 +7966,7 @@ class AstraStudio(QMainWindow):
         self.update_wallpaper_effect_labels()
         self.update_wallpaper_label()
         self.apply_font_settings(reapply_theme=True)
+        self._refresh_color_controls()
         self._save_settings()
         self.statusBar().showMessage("Профиль Astra применён", 3000)
 
@@ -7615,7 +7976,9 @@ class AstraStudio(QMainWindow):
         self.preset_wallpaper_name = ANGEL_404_WALLPAPER
         self.global_font_name = "Minecraft Rus"
         self.custom_wallpaper_path = ""
-        self.wallpaper_enabled = True
+        self.wallpaper_enabled = False
+        self.background_color = "#23182F"
+        self.panel_colors = {}
         self.wallpaper_all_windows = False
         self.disable_console_wallpaper = False
         self.wallpaper_dim_percent = 28
@@ -7651,6 +8014,7 @@ class AstraStudio(QMainWindow):
         self.update_wallpaper_effect_labels()
         self.update_wallpaper_label()
         self.apply_font_settings(reapply_theme=True)
+        self._refresh_color_controls()
         self._save_settings()
         self.statusBar().showMessage("Профиль Angel 404 применён", 3000)
 
@@ -7756,6 +8120,10 @@ class AstraStudio(QMainWindow):
         override = self._resolved_project_python_override(root)
         if override:
             return str(override), []
+        if (self.project_python_interpreter or "").strip():
+            # A missing selected interpreter must not redirect runs or installs
+            # into an unrelated global Python environment.
+            return None, []
         info = detect_project_environment(root)
         if info.python_executable and info.python_executable.is_file():
             return str(info.python_executable), []
@@ -7793,6 +8161,8 @@ class AstraStudio(QMainWindow):
             return str(path)
 
     def select_project_python_interpreter(self):
+        if not self._project_tools_trusted(confirm=True):
+            return False
         root = self._python_project_root()
         start = str(root)
         file_name, _ = QFileDialog.getOpenFileName(
@@ -7804,7 +8174,7 @@ class AstraStudio(QMainWindow):
         if not file_name:
             return
         candidate = Path(file_name)
-        ok, _code, stdout, stderr = self._run_blocking(str(candidate), ["-c", "import sys; print(sys.executable); print(sys.version.split()[0])"], root, timeout_ms=6000)
+        ok, _code, stdout, stderr = self._run_blocking(str(candidate), ["-I", "-c", "import sys; print(sys.executable); print(sys.version.split()[0])"], root, timeout_ms=6000)
         if not ok:
             QMessageBox.warning(self, "Python environment", "Выбранный файл не удалось запустить как Python.\n" + (stderr or stdout))
             return
@@ -7813,19 +8183,22 @@ class AstraStudio(QMainWindow):
         self._refresh_python_environment_status()
         self.statusBar().showMessage("Python-интерпретатор проекта сохранён", 3000)
 
-    def create_project_python_environment(self):
-        root = self._python_project_root()
+    def create_project_python_environment(self, source_path: Path | None = None):
+        root = self._python_project_root(source_path)
+        if not self._project_tools_trusted(confirm=True, root=root):
+            return False
+        root = self._python_project_root(source_path)
         if not root.exists() or not root.is_dir():
             QMessageBox.warning(self, "Python environment", "Папка проекта недоступна.")
-            return
+            return False
         info = detect_project_environment(root)
         if info.python_executable:
             QMessageBox.information(self, "Python environment", f"Проектное окружение уже найдено:\n{info.python_executable}")
             self._refresh_python_environment_status()
-            return
+            return False
         if not can_write_to_directory(root):
             QMessageBox.warning(self, "Python environment", self._permission_help_text(root))
-            return
+            return False
         override = self._resolved_project_python_override(root)
         if override:
             base_python, base_args = str(override), []
@@ -7834,10 +8207,12 @@ class AstraStudio(QMainWindow):
         uv = info.uv_executable
         if not base_python and not uv:
             QMessageBox.warning(self, "Python environment", "Не найден ни Python, ни uv. Установи Python через вкладку «Установщик».")
-            return
+            return False
         env_dir = root / ".venv"
-        if uv:
-            args = ["venv", "--seed"]
+        if uv and not base_args:
+            # uv's pip implementation does not need pip seeded into the venv.
+            # Keep creation offline and preserve a partially created environment.
+            args = ["venv", "--allow-existing", "--no-python-downloads"]
             if base_python:
                 # uv accepts an executable path as --python request.
                 args += ["--python", str(base_python)]
@@ -7846,11 +8221,11 @@ class AstraStudio(QMainWindow):
             description = "uv venv"
         else:
             program = base_python
-            args = [*base_args, "-m", "venv", str(env_dir)]
+            args = [*base_args, "-I", "-m", "venv", str(env_dir)]
             description = "python -m venv"
         self.bottom_tabs.setCurrentIndex(0)
         self.output_console.appendPlainText(f"\n▶ Создание окружения проекта через {description}:\n{self._safe_command_preview(program, args)}\n")
-        self._start_process_task(
+        task = self._start_process_task(
             "python_env_create",
             "Создаётся Python .venv…",
             program,
@@ -7861,6 +8236,8 @@ class AstraStudio(QMainWindow):
             100,
             True,
         )
+
+        return task is not None
 
     def _project_dependency_install_command(self) -> tuple[str | None, list[str], str]:
         root = self._python_project_root()
@@ -7880,12 +8257,14 @@ class AstraStudio(QMainWindow):
         if info.uv_executable and python_exe and pyproject:
             return info.uv_executable, ["pip", "install", "--python", str(python_exe), "-r", str(pyproject)], "uv pip install -r pyproject.toml"
         if python_exe and requirements:
-            return python_exe, [*python_args, "-m", "pip", "install", "-r", str(requirements)], "pip install -r requirements.txt"
+            return python_exe, [*python_args, "-I", "-m", "pip", "install", "-r", str(requirements)], "pip install -r requirements.txt"
         if python_exe and pyproject:
-            return python_exe, [*python_args, "-m", "pip", "install", "-e", str(root)], "pip install -e ."
+            return python_exe, [*python_args, "-I", "-m", "pip", "install", "-e", str(root)], "pip install -e ."
         return None, [], ""
 
     def install_project_python_dependencies(self):
+        if not self._project_tools_trusted(confirm=True):
+            return False
         root = self._python_project_root()
         info = detect_project_environment(root)
         configured_override = (self.project_python_interpreter or "").strip()
@@ -7936,6 +8315,8 @@ class AstraStudio(QMainWindow):
         )
 
     def update_project_pip(self):
+        if not self._project_tools_trusted(confirm=True):
+            return False
         root = self._python_project_root()
         info = detect_project_environment(root)
         configured_override = (self.project_python_interpreter or "").strip()
@@ -7962,7 +8343,9 @@ class AstraStudio(QMainWindow):
         if not python_exe:
             QMessageBox.warning(self, "Python environment", "Python не найден.")
             return
-        args = [*python_args, "-m", "pip", "install", "--upgrade", "pip"]
+        python_exe, args = self._python_package_manager_command(["install", "--upgrade", "pip"])
+        if not python_exe:
+            return
         self.output_console.appendPlainText(f"\n▶ Обновление pip:\n{self._safe_command_preview(python_exe, args)}\n")
         self._start_process_task(
             "python_update_pip",
@@ -7977,6 +8360,8 @@ class AstraStudio(QMainWindow):
         )
 
     def export_project_requirements(self):
+        if not self._project_tools_trusted(confirm=True):
+            return False
         root = self._python_project_root()
         info = detect_project_environment(root)
         configured_override = (self.project_python_interpreter or "").strip()
@@ -7996,7 +8381,7 @@ class AstraStudio(QMainWindow):
             args = ["pip", "freeze", "--python", str(python_exe)]
         else:
             program = python_exe
-            args = [*python_args, "-m", "pip", "freeze"]
+            args = [*python_args, "-I", "-m", "pip", "freeze"]
         ok, _code, stdout, stderr = self._run_blocking(program, args, root, timeout_ms=15000)
         if not ok:
             QMessageBox.warning(self, "Python environment", "Не удалось получить список пакетов.\n" + (stderr or stdout))
@@ -8020,12 +8405,15 @@ class AstraStudio(QMainWindow):
         root = self._python_project_root(source_path)
         info = detect_project_environment(root)
         python_exe, python_args = self._active_python_command(source_path)
-        if info.uv_executable and python_exe and pip_args:
+        if pip_args and pip_args[0] in MUTATING_PIP_ACTIONS:
+            if not info.python_executable and not self._resolved_project_python_override(root):
+                return None, []
+        if info.uv_executable and python_exe and not python_args and pip_args:
             action, *rest = pip_args
             if action in {"install", "uninstall", "freeze", "list", "show", "check"}:
                 return info.uv_executable, ["pip", action, "--python", str(python_exe), *rest]
         if python_exe:
-            return python_exe, [*python_args, "-m", "pip", *pip_args]
+            return python_exe, [*python_args, "-I", "-m", "pip", *pip_args]
         return None, []
 
     def _python_package_record(self, module_or_package: str) -> dict | None:
@@ -8034,6 +8422,8 @@ class AstraStudio(QMainWindow):
         return package_record(module_or_package)
 
     def _python_package_version(self, package_name: str) -> str:
+        if not self._project_tools_trusted(confirm=False):
+            return "не проверено (проект не доверенный)"
         py_program, py_args = self._active_python_command()
         if not py_program:
             return "нет Python"
@@ -8046,13 +8436,16 @@ class AstraStudio(QMainWindow):
             "except Exception:\n"
             "    sys.exit(1)\n"
         )
-        ok, _exit, stdout, _stderr = self._run_blocking(py_program, [*py_args, "-c", code], self.workspace_dir, timeout_ms=4500)
+        ok, _exit, stdout, _stderr = self._run_blocking(py_program, [*py_args, "-I", "-c", code], self.workspace_dir, timeout_ms=4500)
         return stdout.strip() if ok and stdout.strip() else "не установлена"
 
-    def _python_import_available(self, import_name: str) -> bool:
+    def _python_import_available(self, import_name: str, source_path: Path | None = None) -> bool:
+        root = self._python_project_root(source_path)
+        if not self._project_tools_trusted(confirm=True, root=root):
+            return False
         if is_standard_module(import_name):
             return True
-        py_program, py_args = self._active_python_command()
+        py_program, py_args = self._active_python_command(source_path)
         if not py_program:
             return False
         module = (import_name or "").split(".", 1)[0].strip()
@@ -8063,38 +8456,129 @@ class AstraStudio(QMainWindow):
             "module = sys.argv[1]\n"
             "sys.exit(0 if importlib.util.find_spec(module) is not None else 1)\n"
         )
-        ok, _exit, _stdout, _stderr = self._run_blocking(py_program, [*py_args, "-c", code, module], self.workspace_dir, timeout_ms=4500)
+        ok, _exit, _stdout, _stderr = self._run_blocking(py_program, [*py_args, "-I", "-c", code, module], self.workspace_dir, timeout_ms=4500)
         return ok
 
-    def _python_import_status_map(self, import_names: list[str]) -> dict[str, bool]:
-        modules = []
-        seen = set()
-        for name in import_names:
-            module = (name or "").split(".", 1)[0].strip()
-            if not module or module in seen:
-                continue
-            seen.add(module)
-            modules.append(module)
+    def _python_import_status_map(self, import_names: list[str], source_path: Path | None = None) -> dict[str, bool]:
+        root = self._python_project_root(source_path)
+        if not self._project_tools_trusted(confirm=False, root=root):
+            raise ValueError("Project dependency probes require project trust")
+        modules = normalized_import_names(import_names)
         if not modules:
             return {}
-        py_program, py_args = self._active_python_command()
+        py_program, py_args = self._active_python_command(source_path)
         if not py_program:
-            return {module: False for module in modules}
-        code = (
-            "import importlib.util, json, sys\n"
-            "modules = json.loads(sys.argv[1])\n"
-            "print(json.dumps({m: importlib.util.find_spec(m) is not None for m in modules}, ensure_ascii=False))\n"
-        )
-        ok, _exit, stdout, _stderr = self._run_blocking(
-            py_program, [*py_args, "-c", code, json.dumps(modules, ensure_ascii=False)], self.workspace_dir, timeout_ms=6000
+            raise ValueError("Python dependency probe has no selected interpreter")
+        ok, _exit, stdout, stderr = self._run_blocking(
+            py_program, [*py_args, "-I", "-c", IMPORT_PROBE_CODE, json.dumps(modules, ensure_ascii=False)],
+            root, timeout_ms=6000,
         )
         if not ok:
-            return {module: False for module in modules}
+            raise ValueError("Python dependency probe failed: " + (stderr or stdout))
+        return parse_import_probe(stdout, modules)
+
+    def _python_dependency_key(self, source_path: Path | None = None):
+        program, arguments = self._active_python_command(source_path)
+        return (str(self._python_project_root(source_path)), str(program or ""), tuple(arguments))
+
+    def _start_python_import_probe(self, import_names, purpose: str, source_path=None, resume=None):
+        root = self._python_project_root(source_path)
+        if not self._project_tools_trusted(confirm=purpose != "run", root=root):
+            return False
+        modules = normalized_import_names(import_names)
+        program, arguments = self._active_python_command(source_path)
+        if not program or not modules:
+            return False
+        self._python_probe_counter = getattr(self, "_python_probe_counter", 0) + 1
+        task_id = f"python_import_probe_{self._python_probe_counter}"
+        context = {
+            "mode": "python_import_probe", "target": "output", "indeterminate": True,
+            "probe_purpose": purpose, "import_names": modules,
+            "project_context": str(self.project_main_folder),
+            "environment_key": self._python_dependency_key(source_path),
+            "source_path": str(source_path) if source_path else "", "resume": resume or {},
+        }
+        timeout = QTimer(self.task_manager)
+        timeout.setSingleShot(True)
+        timeout.setProperty("probe_task_id", task_id)
+        timeout.timeout.connect(self._expire_python_import_probe)
+        context["probe_timeout"] = timeout
+        task = self._start_process_task(
+            task_id, "Проверяются Python-зависимости…", program,
+            [*arguments, "-I", "-c", IMPORT_PROBE_CODE, json.dumps(modules, ensure_ascii=False)],
+            Path(source_path).parent if source_path else root, context,
+        )
+        if task is not None and self.active_task_context.get("task_id") == task_id:
+            timeout.start(8000)
+        else:
+            self._stop_python_import_probe_timer(context)
+        return task is not None
+
+    def _stop_python_import_probe_timer(self, context):
+        timeout = context.pop("probe_timeout", None)
+        if timeout is not None:
+            timeout.stop()
+            timeout.deleteLater()
+
+    def _expire_python_import_probe(self, task_id=None):
+        if task_id is None:
+            timeout = self.sender()
+            if timeout is None:
+                return
+            task_id = timeout.property("probe_task_id")
+        if self.active_task_context.get("task_id") == task_id and self.task_manager.has_active_task():
+            self.output_console.appendPlainText("\n⚠ Проверка Python превысила 8 секунд и остановлена. Пакеты не переустанавливались. Проверь выбранный интерпретатор и повтори операцию.")
+            self.task_manager.cancel_current_task()
+
+    def _complete_python_import_probe(self, context, success):
+        purpose = context.get("probe_purpose")
+        names = context.get("import_names") or []
         try:
-            data = json.loads(stdout.strip() or "{}")
-            return {module: bool(data.get(module)) for module in modules}
-        except Exception:
-            return {module: False for module in modules}
+            if not success:
+                raise ValueError("интерпретатор не завершил проверку")
+            status = parse_import_probe("".join(context.get("stdout_chunks") or []), names)
+        except ValueError as exc:
+            self.output_console.appendPlainText(f"\n⚠ Проверка зависимостей не выполнена: {exc}. Это не означает, что библиотеки отсутствуют. Автоустановка остановлена; можно повторить проверку.")
+            return
+        source_path = Path(context["source_path"]) if context.get("source_path") else None
+        if context.get("project_context") != str(self.project_main_folder) or context.get("environment_key") != self._python_dependency_key(source_path):
+            self.output_console.appendPlainText("\nℹ Окружение проекта изменилось во время проверки. Повтори операцию в выбранном окружении.")
+            return
+        resume = context.get("resume") or {}
+        if purpose == "run":
+            editor = self.current_editor()
+            if editor is not resume.get("editor") or editor.toPlainText() != resume.get("source_code"):
+                self.output_console.appendPlainText("\nℹ Код изменился во время проверки. Нажми «Запустить» снова.")
+                return
+            self._python_import_preflight = {
+                "key": context["environment_key"], "path": context.get("source_path", ""),
+                "source_code": resume["source_code"], "status": status,
+            }
+            QTimer.singleShot(0, self.run_code)
+            return
+        self._library_status_environment_key = context["environment_key"]
+        if not hasattr(self, "library_status_cache"):
+            self.library_status_cache = {}
+        for name, available in status.items():
+            self.library_status_cache[name] = "установлена" if available else "не установлена"
+        self.populate_library_table()
+        if purpose == "pip":
+            expected = resume.get("pip_action") != "uninstall"
+            failed = [name for name in names if status.get(name) != expected]
+            if failed:
+                self.output_console.appendPlainText("\n⚠ Команда менеджера пакетов завершилась, но итоговое состояние не подтверждено для: " + ", ".join(failed) + ". Автоматический повтор установки отключён; проверь окружение и лог.")
+                return
+            self.output_console.appendPlainText("\n✓ Состояние библиотек после операции проверено.")
+            if resume.get("rerun_after") and expected:
+                editor = self.current_editor()
+                if editor is not resume.get("run_editor") or editor.toPlainText() != resume.get("run_source_code"):
+                    self.output_console.appendPlainText("\nℹ Активный код изменился после установки. Запусти нужную программу вручную.")
+                    return
+                answer = QMessageBox.question(self, "Python-библиотеки", "Библиотека установлена. Запустить программу снова?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes)
+                if answer == QMessageBox.StandardButton.Yes:
+                    self.run_code()
+        else:
+            self.statusBar().showMessage("Статусы библиотек обновлены", 2200)
 
     def _local_python_module_exists(self, module: str, source_path: Path | None = None) -> bool:
         module = (module or "").split(".", 1)[0].strip()
@@ -8121,7 +8605,7 @@ class AstraStudio(QMainWindow):
                 return True
         return False
 
-    def _missing_python_imports_from_code(self, source_code: str, source_path: Path | None = None) -> list[str]:
+    def _missing_python_imports_from_code(self, source_code: str, source_path: Path | None = None, status=None) -> list[str]:
         modules = []
         for module in extract_python_imports(source_code):
             if not module or module.startswith("_"):
@@ -8131,10 +8615,11 @@ class AstraStudio(QMainWindow):
             if self._local_python_module_exists(module, source_path):
                 continue
             modules.append(module)
-        status = self._python_import_status_map(modules)
+        if status is None:
+            status = self._python_import_status_map(modules, source_path)
         return [module for module in modules if not status.get(module, False)]
 
-    def _ask_about_missing_python_module(self, module_name: str, rerun_after: bool = True) -> bool:
+    def _ask_about_missing_python_module(self, module_name: str, rerun_after: bool = True, source_path=None) -> bool:
         module = (module_name or "").split(".", 1)[0].strip()
         if not module or is_standard_module(module):
             return True
@@ -8145,7 +8630,7 @@ class AstraStudio(QMainWindow):
                 self.output_console.appendPlainText(
                     f"⚠ Неизвестный import {module}: включён PyPI fallback, Astra попробует пакет с тем же именем."
                 )
-                self._run_pip_for_record(guessed, ["install", module], rerun_after=rerun_after)
+                self._run_pip_for_record(guessed, ["install", module], rerun_after=rerun_after, source_path=source_path)
                 return False
             box = QMessageBox(self)
             box.setWindowTitle("Python-библиотеки")
@@ -8161,7 +8646,7 @@ class AstraStudio(QMainWindow):
             box.exec()
             clicked = box.clickedButton()
             if clicked == install_btn:
-                self._run_pip_for_record(guessed, ["install", module], rerun_after=rerun_after)
+                self._run_pip_for_record(guessed, ["install", module], rerun_after=rerun_after, source_path=source_path)
             elif clicked == libs_btn:
                 self.open_python_libs_page()
                 if hasattr(self, "custom_pip_edit"):
@@ -8170,7 +8655,7 @@ class AstraStudio(QMainWindow):
             return False
 
         if record.get("safe", True) and not self.python_install_always_ask:
-            self._run_pip_for_record(record, ["install", record["package"]], rerun_after=rerun_after)
+            self._run_pip_for_record(record, ["install", record["package"]], rerun_after=rerun_after, source_path=source_path)
             return False
 
         box = QMessageBox(self)
@@ -8198,13 +8683,28 @@ class AstraStudio(QMainWindow):
         if not record.get("safe", True):
             QMessageBox.warning(self, "Python-библиотеки", "Этот пакет не входит в список автоматической установки. Установи его вручную, если он точно нужен.")
             return False
-        self._run_pip_for_record(record, ["install", record["package"]], rerun_after=rerun_after)
+        self._run_pip_for_record(record, ["install", record["package"]], rerun_after=rerun_after, source_path=source_path)
         return False
 
     def _ensure_python_imports_before_run(self, source_code: str, source_path: Path | None = None) -> bool:
+        if not self._project_tools_trusted(confirm=False, root=self._python_project_root(source_path)):
+            # Explicit Run remains available; automatic dependency/tool execution
+            # from an untrusted project is skipped.
+            return True
         if not self.python_auto_install_enabled:
             return True
-        missing = self._missing_python_imports_from_code(source_code, source_path)
+        modules = [module for module in extract_python_imports(source_code)
+                   if not module.startswith("_") and module not in keyword.kwlist
+                   and not is_standard_module(module) and not self._local_python_module_exists(module, source_path)]
+        if not modules:
+            return True
+        preflight = getattr(self, "_python_import_preflight", None)
+        key = self._python_dependency_key(source_path)
+        if not preflight or preflight.get("key") != key or preflight.get("path") != str(source_path or "") or preflight.get("source_code") != source_code:
+            self._start_python_import_probe(modules, "run", source_path, {"editor": self.current_editor(), "source_code": source_code})
+            return False
+        self._python_import_preflight = None
+        missing = self._missing_python_imports_from_code(source_code, source_path, preflight["status"])
         missing = [m for m in missing if m.lower() not in self.ignored_missing_modules]
         if not missing:
             return True
@@ -8260,14 +8760,14 @@ class AstraStudio(QMainWindow):
                 "\n⚠ Перед запуском Astra установит отсутствующие Python-зависимости: "
                 + ", ".join(str(record.get("package")) for record in candidates)
             )
-            self._run_pip_for_records(candidates, rerun_after=True)
+            self._run_pip_for_records(candidates, rerun_after=True, source_path=source_path)
             return False
 
         module = missing[0]
         self.output_console.appendPlainText(
             f"\n⚠ Перед запуском найден отсутствующий модуль: {module}. Astra предложит способ установки.\n"
         )
-        self._ask_about_missing_python_module(module, rerun_after=True)
+        self._ask_about_missing_python_module(module, rerun_after=True, source_path=source_path)
         return False
 
     def populate_library_table(self):
@@ -8277,6 +8777,10 @@ class AstraStudio(QMainWindow):
         category = self.libs_category_combo.currentText() if hasattr(self, "libs_category_combo") else "Все"
         if not hasattr(self, "library_status_cache"):
             self.library_status_cache = {}
+        environment_key = self._python_dependency_key()
+        if getattr(self, "_library_status_environment_key", None) != environment_key:
+            self.library_status_cache = {}
+            self._library_status_environment_key = environment_key
         rows = []
         for item in PYTHON_LIBRARY_REGISTRY:
             haystack = " ".join([
@@ -8311,11 +8815,8 @@ class AstraStudio(QMainWindow):
             record = item.data(Qt.ItemDataRole.UserRole) if item else None
             if record:
                 records.append(record)
-        status = self._python_import_status_map([record["import"] for record in records])
-        for record in records:
-            self.library_status_cache[record["import"]] = "установлена" if status.get(record["import"], False) else "не установлена"
-        self.populate_library_table()
-        self.statusBar().showMessage("Статусы библиотек обновлены", 2200)
+        if not self._start_python_import_probe([record["import"] for record in records], "libraries"):
+            self.output_console.appendPlainText("\n⚠ Не удалось начать проверку библиотек. Проверь выбранный Python и дождись завершения другой операции.")
 
     def selected_library_record(self) -> dict | None:
         if not hasattr(self, "libs_table"):
@@ -8336,8 +8837,37 @@ class AstraStudio(QMainWindow):
         answer = QMessageBox.question(self, "Python-библиотеки", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         return answer == QMessageBox.StandardButton.Yes
 
-    def _run_pip_for_record(self, record: dict, args: list[str], rerun_after: bool = False):
-        program, command_args = self._python_package_manager_command(args)
+    def _ensure_package_install_environment(self, continuation=None, source_path=None) -> bool:
+        if self.task_manager.has_active_task():
+            self.output_console.appendPlainText("\n⚠ Другая операция уже выполняется. Дождись её завершения.")
+            return False
+        root = self._python_project_root(source_path)
+        if not self._project_tools_trusted(confirm=True, root=root):
+            return False
+        override = self._resolved_project_python_override(root)
+        if (self.project_python_interpreter or "").strip() and override is None:
+            QMessageBox.warning(self, "Python-библиотеки", "Выбранный Python недоступен. Выбери рабочий интерпретатор проекта; глобальное окружение не изменено.")
+            return False
+        if override or detect_project_environment(root).python_executable:
+            return True
+        answer = QMessageBox.question(
+            self, "Python-библиотеки",
+            "Для установки библиотек нужно окружение проекта. Создать .venv и продолжить установку? Глобальный Python останется без изменений.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._python_after_env_create = (str(root), continuation, source_path, str(self.project_main_folder))
+            if not self.create_project_python_environment(source_path):
+                self._python_after_env_create = None
+        return False
+
+    def _run_pip_for_record(self, record: dict, args: list[str], rerun_after: bool = False, source_path=None):
+        if not self._ensure_package_install_environment(
+            lambda: self._run_pip_for_record(record, args, rerun_after=rerun_after, source_path=source_path), source_path
+        ):
+            return False
+        program, command_args = self._python_package_manager_command(args, source_path)
         if not program:
             QMessageBox.warning(self, "Python-библиотеки", "Python/менеджер пакетов не найден. Открой «Установщик» и проверь Python.")
             return False
@@ -8356,18 +8886,22 @@ class AstraStudio(QMainWindow):
             "Идёт установка/обновление Python-библиотеки…",
             program,
             command_args,
-            self._python_project_root(),
-            {"mode": "pip", "package": record["package"], "import_name": record.get("import"), "rerun_after": rerun_after, "indeterminate": True},
+            self._python_project_root(source_path),
+            {"mode": "pip", "package": record["package"], "import_name": record.get("import"), "rerun_after": rerun_after, "run_editor": self.current_editor() if rerun_after else None, "run_source_code": self.current_editor().toPlainText() if rerun_after and self.current_editor() else "", "pip_action": args[0] if args else "install", "root": str(self._python_project_root(source_path)), "source_path": str(source_path) if source_path else "", "environment_key": self._python_dependency_key(source_path), "indeterminate": True},
             10,
             100,
             True,
         )
         return None
 
-    def _run_pip_for_records(self, records: list[dict], rerun_after: bool = False):
+    def _run_pip_for_records(self, records: list[dict], rerun_after: bool = False, source_path=None):
         safe_records = [record for record in records if record and record.get("safe", True)]
         if not safe_records:
             QMessageBox.information(self, "Python-библиотеки", "В выбранном наборе нет библиотек, разрешённых для автоустановки.")
+            return False
+        if not self._ensure_package_install_environment(
+            lambda: self._run_pip_for_records(records, rerun_after=rerun_after, source_path=source_path), source_path
+        ):
             return False
         if self.task_manager.has_active_task():
             self.output_console.appendPlainText("\n⚠ Другая операция уже выполняется. Заверши её или нажми «Отмена».")
@@ -8377,7 +8911,7 @@ class AstraStudio(QMainWindow):
             package = record["package"]
             if package not in packages:
                 packages.append(package)
-        program, command_args = self._python_package_manager_command(["install", *packages])
+        program, command_args = self._python_package_manager_command(["install", *packages], source_path)
         if not program:
             QMessageBox.warning(self, "Python-библиотеки", "Python/менеджер пакетов не найден. Открой «Установщик» и проверь Python.")
             return False
@@ -8391,12 +8925,18 @@ class AstraStudio(QMainWindow):
             "Идёт установка набора Python-библиотек…",
             program,
             command_args,
-            self._python_project_root(),
+            self._python_project_root(source_path),
             {
                 "mode": "pip",
                 "package": ", ".join(packages),
                 "import_names": [record.get("import") for record in safe_records],
                 "rerun_after": rerun_after,
+                "run_editor": self.current_editor() if rerun_after else None,
+                "run_source_code": self.current_editor().toPlainText() if rerun_after and self.current_editor() else "",
+                "pip_action": "install",
+                "root": str(self._python_project_root(source_path)),
+                "source_path": str(source_path) if source_path else "",
+                "environment_key": self._python_dependency_key(source_path),
                 "indeterminate": True,
             },
             10,
@@ -8509,7 +9049,7 @@ class AstraStudio(QMainWindow):
                 "Проверь структуру пакета и пути импорта (PYTHONPATH/расположение запускаемого файла)."
             )
             return
-        self._ask_about_missing_python_module(module, rerun_after=True)
+        self._ask_about_missing_python_module(module, rerun_after=True, source_path=self.last_run_source_path)
 
     def build_current_exe(self):
         if self.task_manager.has_active_task():
@@ -8536,7 +9076,7 @@ class AstraStudio(QMainWindow):
 
     def _build_python_exe(self, source_path: Path):
         record = self._python_package_record("PyInstaller") or {"import": "PyInstaller", "package": "pyinstaller", "warning": "", "heavy": False}
-        if not self._python_import_available("PyInstaller"):
+        if not self._python_import_available("PyInstaller", source_path):
             answer = QMessageBox.question(self, "Сборка EXE", "PyInstaller не установлен. Установить его сейчас?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes)
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -8701,6 +9241,50 @@ class AstraStudio(QMainWindow):
 
     def _project_config_path_for_folder(self, folder: Path) -> Path:
         return Path(folder) / "astral.project.json"
+
+    def _project_tools_trusted(self, confirm: bool = False, root: Path | None = None) -> bool:
+        """Opening a project never authorizes running its tools or plugins."""
+        from core.project_trust import ProjectTrustStore
+
+        roots = [Path(self.project_main_folder)]
+        if root is not None:
+            roots.append(Path(root))
+        config = getattr(self, "current_project_config_path", None)
+        try:
+            # Configuration may point at a different, previously trusted folder.
+            # Its own origin must also be approved before using its interpreter.
+            if config:
+                roots.append(Path(config).resolve().parent)
+            roots = list(dict.fromkeys(path.resolve() for path in roots))
+            internal = (app_data_dir() / "workspace").resolve()
+        except (OSError, RuntimeError):
+            return False
+        store = getattr(self, "_project_trust_store", None)
+        if store is None:
+            store = ProjectTrustStore(app_data_dir() / "trusted_projects.json")
+            self._project_trust_store = store
+        pending = [path for path in roots if path != internal and not store.is_trusted(path)]
+        if not pending:
+            return True
+        if not confirm:
+            return False
+        answer = QMessageBox.question(
+            self, "Доверять инструментам проекта?",
+            "Языковые серверы, Python-окружение и плагины могут выполнять код проекта.\n\n"
+            "Разрешить их запуск для папок проекта и его конфигурации?\n" + "\n".join(str(path) for path in pending) + "\n\n"
+            "Для недоверенного проекта остаются доступны редактор и встроенные подсказки.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            for path in pending:
+                store.set_trusted(path)
+        except OSError as exc:
+            self.write_exception_log("Не удалось сохранить доверие к проекту", exc)
+            return False
+        return True
 
     def _permission_help_text(self, path: Path) -> str:
         return (
@@ -8934,6 +9518,7 @@ class AstraStudio(QMainWindow):
         return result
 
     def _iter_project_text_files(self, max_files: int | None = 6000):
+        from core.file_safety import is_project_text_path
         skipped_dirs = {
             ".git", "node_modules", ".venv", "venv", "__pycache__", "build", "dist",
             ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next", ".cache", ".godot",
@@ -8947,6 +9532,8 @@ class AstraStudio(QMainWindow):
                 current_path = Path(current)
                 for filename in filenames:
                     path = current_path / filename
+                    if not is_project_text_path(path, self._project_search_roots()):
+                        continue
                     lower_name = filename.lower()
                     suffix = path.suffix.lower()
                     special = lower_name in SPECIAL_FILENAMES_TO_LANGUAGE or lower_name.startswith(("dockerfile", "containerfile")) or lower_name.startswith(".env")
@@ -8978,6 +9565,8 @@ class AstraStudio(QMainWindow):
     def _ensure_editor_lsp_open(self, editor):
         if not isinstance(editor, CodeEditor) or editor.file_path is None:
             return
+        if not self._project_tools_trusted(confirm=False):
+            return
         if self.tabs.indexOf(editor) < 0:
             return
         if not self._path_belongs_to_active_project(editor.file_path):
@@ -8997,6 +9586,8 @@ class AstraStudio(QMainWindow):
     def _sync_editor_lsp_change(self, editor):
         if not isinstance(editor, CodeEditor) or editor.file_path is None:
             return
+        if not self._project_tools_trusted(confirm=False):
+            return
         if self.tabs.indexOf(editor) < 0 or not self._path_belongs_to_active_project(editor.file_path):
             return
         try:
@@ -9006,6 +9597,8 @@ class AstraStudio(QMainWindow):
 
     def _save_editor_to_lsp(self, editor):
         if not isinstance(editor, CodeEditor) or editor.file_path is None:
+            return
+        if not self._project_tools_trusted(confirm=False):
             return
         if not self._path_belongs_to_active_project(editor.file_path):
             return
@@ -9121,6 +9714,8 @@ class AstraStudio(QMainWindow):
         if not language:
             QMessageBox.information(self, "LSP", "Выбери язык в таблице LSP.")
             return
+        if not self._project_tools_trusted(confirm=True):
+            return
         config = self.lsp_manager.registry.config_for_language(language)
         if config is None or not config.enabled:
             QMessageBox.information(self, "LSP", f"Для {language} нет включённого LSP по умолчанию. Можно настроить lsp_servers.json вручную.")
@@ -9145,8 +9740,13 @@ class AstraStudio(QMainWindow):
     def _wrap_windows_command_script(self, program: str, arguments: list[str]) -> tuple[str, list[str]]:
         suffix = Path(str(program)).suffix.lower()
         if os.name == "nt" and suffix in {".cmd", ".bat"}:
-            command_line = subprocess.list2cmdline([str(program), *[str(item) for item in arguments]])
-            return os.environ.get("COMSPEC", "cmd.exe"), ["/d", "/s", "/c", command_line]
+            from core.command_launch import windows_tool_command
+            try:
+                return windows_tool_command(str(program), arguments)
+            except ValueError as exc:
+                self.statusBar().showMessage(str(exc), 8000)
+                self.write_log(str(exc))
+                return "", []
         return str(program), [str(item) for item in arguments]
 
     def _node_version_tuple(self, node: str) -> tuple[int, int, int] | None:
@@ -9317,6 +9917,8 @@ class AstraStudio(QMainWindow):
     def _flush_editor_lsp_state(self, editor) -> bool:
         if not isinstance(editor, CodeEditor) or editor.file_path is None:
             return False
+        if not self._project_tools_trusted(confirm=False):
+            return False
         if not self._path_belongs_to_active_project(editor.file_path):
             return False
         timer = getattr(editor, "_astra_lsp_change_timer", None)
@@ -9338,6 +9940,7 @@ class AstraStudio(QMainWindow):
             "version": int(document.version) if document is not None else 0,
             "line": int(cursor.blockNumber()),
             "character": int(cursor.positionInBlock()),
+            "completion_generation": getattr(editor, "_astra_completion_generation", 0),
         }
 
     def _send_ready_lsp_feature(self, language: str, feature: str, path: Path, line: int, character: int, token: dict, extra: dict | None):
@@ -9363,6 +9966,8 @@ class AstraStudio(QMainWindow):
             if not silent:
                 self.statusBar().showMessage("LSP-функция доступна только для сохранённого файла проекта", 3000)
             return False
+        if not self._project_tools_trusted(confirm=not silent):
+            return False
         if not self._flush_editor_lsp_state(editor):
             return False
         cursor = editor.textCursor()
@@ -9384,7 +9989,20 @@ class AstraStudio(QMainWindow):
         return self._send_ready_lsp_feature(language, feature, Path(editor.file_path), line, character, token, extra)
 
     def request_lsp_completion(self):
+        editor = self.current_editor()
+        if isinstance(editor, CodeEditor):
+            editor.setFocus()
+            editor._refresh_builtin_completion(force=True, request_lsp=False)
         self._request_lsp_feature("completion")
+
+    def _request_automatic_lsp_completion(self, editor):
+        if (
+            self.current_editor() is editor
+            and editor.completion_enabled
+            and editor.file_path is not None
+            and self.lsp_manager.server_state(editor.language_name) == "ready"
+        ):
+            self._request_lsp_feature("completion", silent=True)
 
     def request_lsp_hover(self):
         self._request_lsp_feature("hover")
@@ -9430,6 +10048,8 @@ class AstraStudio(QMainWindow):
             document = self.lsp_manager.documents.get(editor.file_path)
             if document is None or int(document.version) != int(token.get("version", -1)):
                 return False
+            if document.text != editor.toPlainText():
+                return False
         return True
 
     def _on_lsp_interactive_result(self, language: str, feature: str, token: object, result: object, error: object):
@@ -9439,6 +10059,14 @@ class AstraStudio(QMainWindow):
             return
         if feature == "completion":
             if not self._token_matches_current_document(token, strict_version=True):
+                return
+            editor = self.current_editor()
+            if language != editor.language_name:
+                return
+            cursor = editor.textCursor()
+            if (cursor.blockNumber(), cursor.positionInBlock()) != (token.get("line"), token.get("character")):
+                return
+            if token.get("completion_generation", 0) != getattr(editor, "_astra_completion_generation", 0):
                 return
             self._show_lsp_completion(result)
         elif feature == "hover":
@@ -9503,25 +10131,14 @@ class AstraStudio(QMainWindow):
         editor = self.current_editor()
         if not isinstance(editor, CodeEditor):
             return
-        items = normalize_completion_items(result)
-        if not items:
-            self.statusBar().showMessage("LSP: вариантов completion нет", 1800)
-            return
-        menu = QMenu(editor)
-        menu.setStyleSheet(self.styleSheet())
-        action_map = {}
-        for item in items[:100]:
-            detail = item.get("detail") or ""
-            label = item.get("label") or ""
-            text = f"{label}    {detail}" if detail else label
-            action = menu.addAction(text)
-            if item.get("documentation"):
-                action.setToolTip(str(item["documentation"])[:1200])
-            action_map[action] = item
-        chosen = menu.exec(editor.viewport().mapToGlobal(editor.cursorRect().bottomLeft()))
-        item = action_map.get(chosen)
-        if item:
-            self._apply_lsp_completion_item(editor, item)
+        text = editor.toPlainText()
+        query = completion_query_from_lsp_items(
+            text, utf16_offset_to_text(text, editor.textCursor().position()), normalize_completion_items(result),
+        )
+        # Keep useful offline suggestions when a server is unavailable or has no
+        # valid matches. Completion never opens a nested, modal QMenu event loop.
+        if query is not None:
+            editor._show_completion_query(query)
 
     def _lsp_cursor_position(self, editor: CodeEditor, line: int, character: int) -> int:
         block = editor.document().findBlockByNumber(max(0, int(line)))
@@ -9531,22 +10148,15 @@ class AstraStudio(QMainWindow):
         return block.position() + min(max(0, int(character)), max_character)
 
     def _apply_lsp_completion_item(self, editor: CodeEditor, item: dict):
-        cursor = editor.textCursor()
-        text_edit = item.get("text_edit") if isinstance(item.get("text_edit"), dict) else None
-        new_text = str((text_edit or {}).get("newText") or item.get("insert_text") or item.get("label") or "")
-        if text_edit and isinstance(text_edit.get("range"), dict):
-            raw_range = text_edit["range"]
-            start = raw_range.get("start") if isinstance(raw_range.get("start"), dict) else {}
-            end = raw_range.get("end") if isinstance(raw_range.get("end"), dict) else {}
-            start_pos = self._lsp_cursor_position(editor, int(start.get("line", 0)), int(start.get("character", 0)))
-            end_pos = self._lsp_cursor_position(editor, int(end.get("line", 0)), int(end.get("character", 0)))
-            cursor.setPosition(start_pos)
-            cursor.setPosition(max(start_pos, end_pos), QTextCursor.MoveMode.KeepAnchor)
-        else:
-            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
-        cursor.insertText(new_text)
-        editor.setTextCursor(cursor)
-        editor.setFocus()
+        text = editor.toPlainText()
+        query = completion_query_from_lsp_items(
+            text, utf16_offset_to_text(text, editor.textCursor().position()), [item],
+        )
+        if query is None:
+            return False
+        editor._show_completion_query(query)
+        display = next(iter(editor._builtin_completion_items), "")
+        return editor._insert_builtin_completion(display)
 
     def _open_lsp_location(self, location):
         path = location.path
@@ -10054,6 +10664,9 @@ class AstraStudio(QMainWindow):
                 return None
 
         def read_text(path: Path):
+            from core.file_safety import is_project_text_path
+            if not is_project_text_path(path, self._project_search_roots()):
+                return None, None
             try:
                 return path.read_text(encoding="utf-8"), "utf-8"
             except UnicodeDecodeError:
@@ -10226,7 +10839,8 @@ class AstraStudio(QMainWindow):
             changed_texts = {}
             for path, updated, count, target_encoding in pending_changes:
                 try:
-                    path.write_text(updated, encoding=target_encoding)
+                    from core.file_safety import write_project_text
+                    write_project_text(path, updated, target_encoding, self._project_search_roots())
                 except (OSError, UnicodeError) as exc:
                     failed.append(f"{self._relative_project_label(path)}: {exc}")
                     continue
@@ -12298,7 +12912,20 @@ class AstraStudio(QMainWindow):
             self.open_installer_tab()
             return
         if os.name != "nt":
-            QMessageBox.information(self, "Установщик", f"Диагностика инструментов {APP_VERSION} рассчитана на Windows.")
+            program, prefix = python_command()
+            if not program:
+                QMessageBox.information(self, "Установщик", "Для диагностики нужен внешний Python 3. Установи его штатным пакетным менеджером ОС и повтори проверку.")
+                return
+            self.open_installer_tab()
+            self.installer_console.clear()
+            self.installer_console.appendPlainText(f"▶ {title}\n")
+            arguments = [*prefix, "-u", str(resource_path("scripts/check_tools.py"))]
+            if mode == "update_check":
+                arguments.append("--updates")
+            self._start_process_task(
+                task_id, title, program, arguments, self.data_dir,
+                {"mode": mode, "target": "installer", "indeterminate": True},
+            )
             return
         self.open_installer_tab()
         self.installer_console.clear()
@@ -12680,7 +13307,8 @@ if ($winget) {
     $step = [Math]::Max(1, [int](70 / $checks.Count))
     foreach ($item in $checks) {
         Write-Host "`n▶ $($item.Name)"
-        & $winget.Source upgrade --id $item.Id --accept-source-agreements 2>&1 | ForEach-Object { Write-Host $_ }
+        # Read-only query: `winget upgrade --id` would install the update.
+        & $winget.Source list --id $item.Id --exact --upgrade-available --accept-source-agreements 2>&1 | ForEach-Object { Write-Host $_ }
         $progress = [Math]::Min(82, $progress + $step)
         P $progress
     }
@@ -13395,10 +14023,7 @@ Astra-Progress 100
         try:
             if process.state() == QProcess.ProcessState.NotRunning:
                 return
-            process.terminate()
-            if not process.waitForFinished(1200):
-                process.kill()
-                process.waitForFinished(1200)
+            stop_process_and_wait(process)
             self.write_log(f"Процесс остановлен при закрытии: {name}")
         except Exception as exc:
             self.write_exception_log(f"Ошибка остановки процесса при закрытии: {name}", exc)
@@ -13445,45 +14070,18 @@ Astra-Progress 100
         return super().eventFilter(watched, event)
 
     def _apply_responsive_layout(self):
-        """Keep drawers readable across common laptop widths and DPI scales."""
-        if not all(hasattr(self, name) for name in ("tools_drawer", "project_panel", "main_splitter")):
-            return
-        tools_open = not self.tools_drawer.isHidden()
-        was_hidden = bool(getattr(self, "_responsive_project_hidden", False))
-        # The project tree is user-sized and must never disappear merely because
-        # another drawer opened or Windows DPI scaling reduced logical width.
-        if was_hidden:
+        """Let Qt layouts and scroll areas handle logical-pixel constraints.
+
+        Never hide navigation or reset a user's splitter sizes during resize.
+        The compatibility flags only restore panels hidden by the old policy.
+        """
+        if bool(getattr(self, "_responsive_project_hidden", False)) and hasattr(self, "project_panel"):
             self.project_panel.setVisible(True)
             self._responsive_project_hidden = False
-            total = max(530, self.main_splitter.width())
-            restored_width = max(240, int((self.saved_main_splitter_sizes or [320])[0] or 320))
-            self.main_splitter.setSizes([restored_width, max(300, total - restored_width)])
-        if hasattr(self, "root_splitter") and tools_open:
-            total = max(720, self.root_splitter.width())
-            sidebar_visible = getattr(self, "sidebar_shell", None) is not None and self.sidebar_shell.isVisible()
-            if total < 1080 and sidebar_visible:
-                self.sidebar_shell.setVisible(False)
-                self.btn_restore_sidebar.setVisible(True)
-                self._responsive_sidebar_hidden = True
-                sidebar_visible = False
-            elif total >= 1080 and bool(getattr(self, "_responsive_sidebar_hidden", False)):
-                self.sidebar_shell.setVisible(True)
-                self.btn_restore_sidebar.setVisible(False)
-                self._responsive_sidebar_hidden = False
-                sidebar_visible = True
-            sidebar_width = min(240, max(210, self.root_splitter.sizes()[0] if sidebar_visible else 0)) if sidebar_visible else 0
-            minimum_editor = 520 if total >= 1250 else 360
-            drawer_width = max(360, min(600, int(total * 0.36), total - sidebar_width - minimum_editor))
-            editor_width = max(260, total - sidebar_width - drawer_width)
-            self.tools_drawer.setMinimumWidth(drawer_width)
-            self.root_splitter.setSizes([sidebar_width, drawer_width, editor_width])
-        elif bool(getattr(self, "_responsive_sidebar_hidden", False)):
+        if bool(getattr(self, "_responsive_sidebar_hidden", False)) and hasattr(self, "sidebar_shell"):
             self.sidebar_shell.setVisible(True)
             self.btn_restore_sidebar.setVisible(False)
             self._responsive_sidebar_hidden = False
-            self.tools_drawer.setMinimumWidth(310)
-        if hasattr(self, "sidebar_scroll"):
-            self.sidebar_scroll.horizontalScrollBar().setValue(0)
 
     def closeEvent(self, event):
         try:

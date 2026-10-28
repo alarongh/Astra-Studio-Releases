@@ -65,7 +65,8 @@ def test_release_36_main_window_uses_native_caption_not_custom_close_wiring():
 
 def test_release_36_full_suite_bootstraps_qapplication_before_core_qt_tests():
     text = PYTEST_BOOTSTRAP.read_text(encoding="utf-8")
-    assert 'sys.platform != "win32"' in text
+    assert 'sys.platform != "win32"' not in text
+    assert "session.config.option.collectonly" in text
     assert "QApplication.instance() or QApplication([])" in text
     assert "setQuitOnLastWindowClosed(False)" in text
 

@@ -60,17 +60,8 @@ def _contains_matching_file(root: Path, patterns: tuple[str, ...], limit: int = 
 
 def _is_writable_directory(root: Path) -> bool:
     """Probe write access instead of trusting os.access on Windows ACLs."""
-    probe = root / ".astra_doctor_write_test.tmp"
-    try:
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
-        return True
-    except OSError:
-        try:
-            probe.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
+    from .file_safety import directory_is_writable
+    return directory_is_writable(root)
 
 
 def _find_rojo_project(root: Path) -> Path | None:

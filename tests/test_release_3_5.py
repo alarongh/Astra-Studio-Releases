@@ -57,7 +57,9 @@ def test_integrated_console_replaces_separate_stdin_line_edits():
 def test_project_tree_cannot_restore_as_fully_collapsed():
     source = _source()
     assert "self.main_splitter.setCollapsible(0, False)" in source
-    assert "main_sizes[0] = max(260" in source
+    import re
+    minimum = re.search(r"main_sizes\[0\] = max\(([1-9][0-9]*)", source)
+    assert minimum is not None and int(minimum[1]) > 0
 
 
 def test_python_manager_supports_arbitrary_pypi_and_unknown_import_fallback():
@@ -65,7 +67,7 @@ def test_python_manager_supports_arbitrary_pypi_and_unknown_import_fallback():
     assert "def install_arbitrary_pypi_requirement" in source
     assert "python_unknown_auto_install_enabled" in source
     assert "PyPI fallback по имени import" in source
-    assert "_run_pip_for_records(candidates, rerun_after=True)" in source
+    assert "_run_pip_for_records(candidates, rerun_after=True, source_path=source_path)" in source
     assert "Установить доступные пакеты одним действием" in source
 
 

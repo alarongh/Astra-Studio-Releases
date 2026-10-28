@@ -23,11 +23,6 @@ REQUIRED_ASSETS = [
     ROOT / "assets" / "astra_angel404.ico",
     ROOT / "assets" / "astra_angel404.png",
     ROOT / "assets" / "astra_studio_title.png",
-    *(ROOT / "assets" / "wallpapers" / name for name in [
-        "astra_neon_core.png", "astra_deep_space.png", "astra_blue_horizon.png", "astra_eclipse.png",
-        "astra_crown_night.png", "astra_sakura_dusk.png", "astra_cyber_ritual.png", "astra_crimson_prayer.png",
-        "angel_404.png",
-    ]),
     ROOT / "assets" / "fonts" / "minecraft.ttf",
 ]
 REQUIRED_SCRIPTS = [

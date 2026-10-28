@@ -126,8 +126,8 @@ class PythonEnvironmentTests(unittest.TestCase):
             python_path.parent.mkdir(parents=True)
             python_path.write_bytes(b"")
             info = detect_project_environment(root)
-            self.assertEqual(info.environment_dir, env)
-            self.assertEqual(info.python_executable, python_path)
+            self.assertEqual(info.environment_dir, env.resolve())
+            self.assertEqual(info.python_executable, python_path.resolve())
             self.assertTrue(info.is_project_environment)
 
     def test_external_virtual_env_is_not_mistaken_for_project_env(self):
@@ -178,7 +178,9 @@ class TaskManagerStaticTests(unittest.TestCase):
         text = (ROOT / "core" / "task_manager.py").read_text(encoding="utf-8")
         self.assertIn("return self.current_task is not None", text)
         self.assertIn("def cancel_and_wait", text)
-        self.assertIn("process.waitForFinished", text)
+        self.assertIn("stop_process_and_wait(process, timeout_ms)", text)
+        process_text = (ROOT / "core" / "process_control.py").read_text(encoding="utf-8")
+        self.assertIn("process.waitForFinished", process_text)
 
 
 class MainStaticTests(unittest.TestCase):
@@ -220,7 +222,7 @@ class MainStaticTests(unittest.TestCase):
     def test_search_replace_rescans_and_preserves_legacy_encoding(self):
         self.assertIn("Always rescan with the current query/options", self.source)
         self.assertIn('return path.read_text(encoding="cp1251"), "cp1251"', self.source)
-        self.assertIn('path.write_text(updated, encoding=target_encoding)', self.source)
+        self.assertIn('write_project_text(path, updated, target_encoding, self._project_search_roots())', self.source)
 
 
     def test_settings_load_save_key_parity(self):
@@ -243,6 +245,13 @@ class MainStaticTests(unittest.TestCase):
                 loaded.add(node.args[0].value)
 
         saved = set()
+        appearance = ast.parse((ROOT / "core" / "appearance.py").read_text(encoding="utf-8"))
+        for node in ast.walk(appearance):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "settings"
+                    and node.func.attr == "get" and node.args
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                loaded.add(node.args[0].value)
         for node in ast.walk(save):
             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "data" for t in node.targets) and isinstance(node.value, ast.Dict):
                 saved.update(

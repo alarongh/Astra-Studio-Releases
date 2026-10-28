@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import struct
 import sys
 from pathlib import Path
 
@@ -13,20 +12,19 @@ WALLPAPER = ROOT / "assets" / "wallpapers" / "angel_404.png"
 FONT = ROOT / "assets" / "fonts" / "minecraft.ttf"
 
 
-def test_angel_404_assets_are_bundled_and_valid():
-    wallpaper = WALLPAPER.read_bytes()
-    assert wallpaper.startswith(b"\x89PNG\r\n\x1a\n")
-    assert struct.unpack(">II", wallpaper[16:24]) == (1672, 941)
+def test_angel_404_font_is_bundled_and_builtin_photo_is_retired():
+    assert not WALLPAPER.exists()
     font = FONT.read_bytes()
     assert len(font) > 20_000
     assert font[:4] in {b"\x00\x01\x00\x00", b"OTTO"}
 
 
-def test_angel_404_theme_profile_and_wallpaper_are_wired():
+def test_angel_404_theme_profile_uses_solid_background():
     text = MAIN.read_text(encoding="utf-8")
     assert 'ANGEL_404_THEME = "Angel 404: Фиолетовый сбой"' in text
     assert 'ANGEL_404_ACCENT = "Angel 404 неон"' in text
-    assert 'ANGEL_404_WALLPAPER: "assets/wallpapers/angel_404.png"' in text
+    assert 'ASTRA_WALLPAPERS = {}' in text
+    assert 'self.background_color = "#23182F"' in text
     assert "self.design_profile_combo.currentTextChanged.connect(self.change_design_profile)" in text
     assert 'self.design_profile_combo.addItems(APPEARANCE_PROFILES)' in text
     assert 'self.global_font_name = "Minecraft Rus"' in text

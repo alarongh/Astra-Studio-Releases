@@ -145,13 +145,14 @@ def test_settings_full_page_and_single_wallpaper_are_stable_on_laptop(monkeypatc
     assert not window.tools_drawer.isVisible()
     assert not window.root_splitter.isVisible()
     assert window.settings_page.width() >= 1000
-    assert window._wallpaper_tile.size() == main.WALLPAPER_TILE_SIZE
-    tile_cache_key = window._wallpaper_tile.cacheKey()
+    assert window.current_wallpaper_path() is None
+    assert window.background_label.isHidden()
+    background = window.background_color
 
     window.resize(1600, 900)
     app.processEvents()
     assert window.main_page_stack.currentWidget() is window.settings_page
-    assert window._wallpaper_tile.cacheKey() == tile_cache_key
-    assert window.background_label.pixmap().size() == window.workspace_surface.size()
+    assert window.background_color == background
+    assert window.background_label.isHidden()
     window.close()
     app.processEvents()

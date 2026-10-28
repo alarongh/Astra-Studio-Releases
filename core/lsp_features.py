@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 from .lsp_protocol import path_to_uri, uri_to_path
+from .language_completion import (
+    CompletionItem, CompletionQuery, CompletionTextEdit,
+    completion_edit_plan, text_offset_to_utf16, utf16_offset_to_text,
+)
 
 
 LSP_FEATURE_METHODS: dict[str, str] = {
@@ -96,13 +101,19 @@ def normalize_completion_items(result: Any) -> list[dict[str, Any]]:
         label = str(raw.get("label") or "").strip()
         if not label:
             continue
+        # The client does not advertise snippet support. Keep unsupported snippets
+        # out of the plain-text insertion path instead of inserting ${1:...} code.
+        if raw.get("insertTextFormat") == 2:
+            continue
         text_edit = raw.get("textEdit") if isinstance(raw.get("textEdit"), dict) else None
-        # LSP 3.17 also permits InsertReplaceEdit. Astra B3 intentionally accepts
-        # only the normal TextEdit form; servers were told snippetSupport=False.
         if text_edit is not None and "range" not in text_edit:
-            text_edit = None
+            # Use the replacement range of an LSP InsertReplaceEdit so accepting
+            # an item in the middle of a word cannot duplicate its old suffix.
+            if not isinstance(text_edit.get("replace"), dict):
+                continue
+            text_edit = {"range": text_edit["replace"], "newText": text_edit.get("newText")}
         insert_text = raw.get("insertText")
-        if not isinstance(insert_text, str) or not insert_text:
+        if not isinstance(insert_text, str):
             insert_text = label
         items.append({
             "label": label,
@@ -113,9 +124,68 @@ def normalize_completion_items(result: Any) -> list[dict[str, Any]]:
             "sort_text": str(raw.get("sortText") or label),
             "kind": _int(raw.get("kind"), 0),
             "text_edit": text_edit,
+            "additional_text_edits": raw.get("additionalTextEdits", []),
         })
     items.sort(key=lambda item: (item["sort_text"].lower(), item["label"].lower()))
     return items
+
+
+def _completion_range_edit(text: str, raw: Any) -> CompletionTextEdit:
+    """Reject bad server ranges instead of clamping them into unrelated code."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("newText"), str):
+        raise ValueError("Invalid completion text edit")
+    source_range = raw.get("range")
+    if not isinstance(source_range, dict):
+        raise ValueError("Invalid completion range")
+    lines = text.split("\n")
+
+    def offset(position: Any) -> int:
+        if not isinstance(position, dict):
+            raise ValueError("Invalid completion position")
+        line, column = position.get("line"), position.get("character")
+        if type(line) is not int or type(column) is not int or not 0 <= line < len(lines) or column < 0:
+            raise ValueError("Invalid completion position")
+        content = lines[line].removesuffix("\r")
+        index = utf16_offset_to_text(content, column)
+        if text_offset_to_utf16(content, index) != column:
+            raise ValueError("Completion position exceeds a line or splits a character")
+        return sum(len(part) + 1 for part in lines[:line]) + index
+
+    start, end = offset(source_range.get("start")), offset(source_range.get("end"))
+    if end < start:
+        raise ValueError("Reversed completion range")
+    return CompletionTextEdit(start, end, raw["newText"])
+
+
+def completion_query_from_lsp_items(text: str, cursor_offset: int, items: list[dict[str, Any]]) -> CompletionQuery | None:
+    """Convert LSP edits to the same non-modal, validated offline popup model."""
+    cursor_offset = max(0, min(len(text), int(cursor_offset)))
+    match = re.search(r"[\w$-]*\Z", text[:cursor_offset])
+    start = match.start() if match else cursor_offset
+    prefix = text[start:cursor_offset]
+    candidates: list[CompletionItem] = []
+    query = CompletionQuery(start, cursor_offset, prefix, ())
+    for item in items:
+        if not str(item.get("filter_text") or item["label"]).casefold().startswith(prefix.casefold()):
+            continue
+        try:
+            primary = _completion_range_edit(text, item["text_edit"]) if item.get("text_edit") is not None else None
+            if primary is not None and not primary.start <= cursor_offset <= primary.end:
+                continue
+            additional = item.get("additional_text_edits", [])
+            if not isinstance(additional, list):
+                continue
+            additional_edits = tuple(_completion_range_edit(text, edit) for edit in additional)
+            insertion = primary.new_text if primary is not None else str(item.get("insert_text", item["label"]))
+            candidate = CompletionItem(
+                str(item["label"]), insertion, str(item.get("detail") or "LSP"), "lsp",
+                additional_edits, len(insertion), primary,
+            )
+            completion_edit_plan(text, query, candidate)
+        except (KeyError, TypeError, ValueError):
+            continue
+        candidates.append(candidate)
+    return CompletionQuery(start, cursor_offset, prefix, tuple(candidates[:100])) if candidates else None
 
 
 def hover_text(result: Any) -> str:

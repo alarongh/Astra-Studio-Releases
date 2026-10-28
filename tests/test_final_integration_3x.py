@@ -99,11 +99,6 @@ def test_lsp_catalog_matches_all_supported_languages():
 def test_runtime_assets_scripts_and_build_inputs_exist():
     assets = [
         "assets/astra.ico", "assets/astra.png", "assets/astra_angel404.ico", "assets/astra_angel404.png", "assets/astra_studio_title.png",
-        *[f"assets/wallpapers/{name}" for name in (
-            "astra_neon_core.png", "astra_deep_space.png", "astra_blue_horizon.png", "astra_eclipse.png",
-            "astra_crown_night.png", "astra_sakura_dusk.png", "astra_cyber_ritual.png", "astra_crimson_prayer.png",
-            "angel_404.png",
-        )],
         "assets/fonts/minecraft.ttf",
     ]
     scripts = [
@@ -166,7 +161,10 @@ def test_shutdown_paths_cover_tasks_lsp_run_terminal_and_installer():
         assert token in close
     task_text = (CORE / "task_manager.py").read_text(encoding="utf-8")
     assert "def cancel_and_wait" in task_text
-    assert "process.terminate()" in task_text and "process.kill()" in task_text
+    assert "stop_process_and_wait(process, timeout_ms)" in task_text
+    process_text = (CORE / "process_control.py").read_text(encoding="utf-8")
+    assert "process.terminate()" in process_text and "process.kill()" in process_text
+    assert "waitForFinished" in process_text
 
 
 def test_python_project_environment_does_not_adopt_unrelated_virtualenv(tmp_path):
@@ -211,6 +209,8 @@ def test_settings_loader_and_saver_keys_remain_symmetric():
     save_end = text.find("\n    def ", save_start + 20)
     save_text = text[save_start: save_end if save_end != -1 else len(text)]
     loaded = set(re.findall(r'data\.get\("([^"]+)"\)', load_text))
+    appearance_text = (CORE / "appearance.py").read_text(encoding="utf-8")
+    loaded |= set(re.findall(r'settings\.get\("([^"]+)"', appearance_text))
     saved = set(re.findall(r'"([^"]+)"\s*:', save_text))
     legacy_appearance_keys = {
         "aux_bg_transparency_percent",

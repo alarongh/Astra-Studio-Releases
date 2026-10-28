@@ -4,9 +4,10 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import time
+import weakref
 from typing import Any
 
-from PySide6.QtCore import QObject, QCoreApplication, QProcess, QProcessEnvironment, QTimer, Signal
+from PySide6.QtCore import QObject, QCoreApplication, QProcess, QProcessEnvironment, QTimer, Signal, Slot
 
 from .lsp_servers import LspServerRegistry, ResolvedLspServer
 from .lsp_documents import LspDocumentStore, LspDiagnosticsStore
@@ -89,6 +90,15 @@ class LspClientConnection(QObject):
         return bool(self.process and self.process.state() != QProcess.ProcessState.NotRunning)
 
     def start(self):
+        guard = getattr(self, "launch_guard", None)
+        if guard is not None:
+            try:
+                allowed = bool(guard())
+            except Exception:
+                allowed = False
+            if not allowed:
+                self.shutdown()
+                return
         if self.is_running() or self.state in {self.STARTING, self.INITIALIZING, self.READY}:
             return
         self._restart_timer.stop()
@@ -145,6 +155,7 @@ class LspClientConnection(QObject):
                     "completion": {
                         "completionItem": {
                             "snippetSupport": False,
+                            "insertReplaceSupport": True,
                             "documentationFormat": ["markdown", "plaintext"],
                         }
                     },
@@ -445,9 +456,14 @@ class LspManager(QObject):
         user_config_path: Path | str | None = None,
         project_root: Path | str | None = None,
         parent: QObject | None = None,
+        *,
+        launch_guard=None,
     ):
         super().__init__(parent)
         self.registry = LspServerRegistry(user_config_path)
+        # Standalone API users may supply their own trust policy. The IDE always
+        # supplies its per-user project trust guard; project JSON cannot grant it.
+        self.launch_guard = launch_guard
         self.project_root = Path(project_root).resolve() if project_root else None
         self.connections: dict[str, QObject] = {}
         self._retiring_connections: list[QObject] = []
@@ -477,8 +493,17 @@ class LspManager(QObject):
             return LspTcpConnection(resolved, self.project_root, self)
         return None
 
+    def _launch_allowed(self) -> bool:
+        try:
+            return self.launch_guard is None or bool(self.launch_guard())
+        except Exception:
+            return False
+
     def ensure_server(self, language: str):
         if self.project_root is None:
+            return None
+        if not self._launch_allowed():
+            self.stop_server(language)
             return None
         existing = self.connections.get(language)
         existing_state = getattr(existing, "state", "") if existing else ""
@@ -506,6 +531,9 @@ class LspManager(QObject):
         return self.connections.get(language)
 
     def restart_server(self, language: str) -> bool:
+        if not self._launch_allowed():
+            self.stop_server(language)
+            return False
         self._failure_retry_after.pop(language, None)
         connection = self.connections.get(language)
         if connection is None:
@@ -537,19 +565,27 @@ class LspManager(QObject):
     def _retire_connection(self, connection, wait: bool):
         if connection not in self._retiring_connections:
             self._retiring_connections.append(connection)
+        # Retired clients can never be restarted, even while an asynchronous
+        # shutdown/deferred deletion is still pending for the same project root.
+        connection.launch_guard = lambda: False
         if wait:
             connection.shutdown_and_wait()
             self._finish_retiring_connection(connection)
             return
-        connection.stateChanged.connect(
-            lambda _language, state, current=connection: self._on_retiring_state(current, state)
-        )
+        # A lambda capturing both parent manager and child connection can keep
+        # the parent alive until the child's QObject destructor releases it,
+        # re-entering parent/child destruction. A QObject receiver is weakly held
+        # and Qt disconnects it automatically when that receiver is destroyed.
+        connection.stateChanged.connect(self._on_retiring_state)
+        connection._astra_retirement_slot_connected = True
         connection.shutdown()
         if connection.state in {"stopped", "failed"}:
             self._finish_retiring_connection(connection)
 
-    def _on_retiring_state(self, connection, state: str):
-        if state in {"stopped", "failed"}:
+    @Slot(str, str)
+    def _on_retiring_state(self, _language: str, state: str):
+        connection = self.sender()
+        if connection is not None and state in {"stopped", "failed"}:
             self._finish_retiring_connection(connection)
 
     def _finish_retiring_connection(self, connection):
@@ -557,12 +593,25 @@ class LspManager(QObject):
             self._retiring_connections.remove(connection)
         except ValueError:
             return
+        if getattr(connection, "_astra_retirement_slot_connected", False):
+            connection.stateChanged.disconnect(self._on_retiring_state)
+            connection._astra_retirement_slot_connected = False
         connection.deleteLater()
 
     def available_languages(self) -> dict[str, bool]:
         return self.registry.availability(self.project_root)
 
     def _wire_connection(self, connection):
+        # A queued crash-restart must recheck trust and cannot restart a client
+        # belonging to a project that the manager has already left.
+        manager_ref = weakref.ref(self)
+        root = self.project_root
+
+        def launch_allowed():
+            manager = manager_ref()
+            return manager is not None and manager.project_root == root and manager._launch_allowed()
+
+        connection.launch_guard = launch_allowed
         connection.stateChanged.connect(self._on_connection_state_changed)
         connection.logMessage.connect(self.logMessage)
         connection.initialized.connect(self._on_connection_initialized)

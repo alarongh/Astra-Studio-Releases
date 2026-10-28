@@ -18,7 +18,7 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[("assets", "assets"), ("scripts/create_desktop_shortcut.ps1", "scripts"), ("update_channel.json", ".")],
+    datas=[("assets", "assets"), ("data", "data"), ("scripts/create_desktop_shortcut.ps1", "scripts"), ("update_channel.json", ".")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
