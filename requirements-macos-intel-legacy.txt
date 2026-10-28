@@ -1,0 +1,4 @@
+# Intel macOS 11 Big Sur compatibility; build with CPython 3.12.
+PySide6==6.6.3.1
+pyinstaller==6.22.2
+PyYAML==6.0.3

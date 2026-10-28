@@ -50,7 +50,7 @@ def minimum_from_load_commands(output: str) -> str | None:
     return max(versions, key=lambda value: tuple(int(part) for part in value.split("."))) if versions else None
 
 
-def deployment_target() -> str:
+def deployment_target(minimum_floor: str = MINIMUM_MACOS) -> str:
     # The build host's Python can require a newer OS than Qt's supported floor.
     # Do not mislabel, for example, a Homebrew Python linked for macOS 26.
     otool = shutil.which("otool")
@@ -61,7 +61,7 @@ def deployment_target() -> str:
     if pyside is None or not pyside.origin:
         raise RuntimeError("Install requirements.txt in the current build environment first")
     binaries.append(Path(pyside.origin).parent / "Qt" / "lib" / "QtCore.framework" / "Versions" / "A" / "QtCore")
-    versions = [MINIMUM_MACOS]
+    versions = [minimum_floor]
     for binary in binaries:
         output = subprocess.run([otool, "-l", str(binary)], check=True, text=True, capture_output=True).stdout
         version = minimum_from_load_commands(output)
@@ -94,17 +94,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--arch", choices=("arm64", "x86_64", "universal2"), default=platform.machine())
     parser.add_argument("--dmg", action="store_true", help="also create a DMG with an Applications shortcut")
     parser.add_argument("--codesign-identity", help="optional existing Developer ID identity; default is ad-hoc signing")
+    parser.add_argument("--target-macos", choices=("11.0", "13.0"), help="fail if the bundled runtime requires a newer macOS")
+    parser.add_argument("--variant", choices=("standard", "legacy"), default="standard")
     args = parser.parse_args(argv)
     if sys.platform != "darwin":
         parser.error("Run this build on macOS with a matching Python/PySide6 architecture.")
     for needed in ("main.py", "assets", "data/python_libraries.json", "update_channel.json"):
         if not (ROOT / needed).exists():
             parser.error(f"Source distribution is incomplete: {needed}")
-    build_dir = ROOT / "build" / f"macos-{args.arch}"
-    dist_dir = ROOT / "dist" / f"macos-{args.arch}"
+    suffix = f"{args.arch}-{args.variant}"
+    build_dir = ROOT / "build" / f"macos-{suffix}"
+    dist_dir = ROOT / "dist" / f"macos-{suffix}"
     build_dir.mkdir(parents=True, exist_ok=True)
     dist_dir.mkdir(parents=True, exist_ok=True)
-    minimum_macos = deployment_target()
+    minimum_macos = deployment_target(args.target_macos or MINIMUM_MACOS)
+    if args.target_macos and tuple(map(int, minimum_macos.split('.'))) > tuple(map(int, args.target_macos.split('.'))):
+        parser.error(f"Runtime requires macOS {minimum_macos}; requested compatibility is {args.target_macos}")
     print(f"Bundle requires macOS {minimum_macos}+ (verified Python and Qt load commands)", flush=True)
     icon = build_icon(build_dir)
     spec = build_dir / "astra_macos.spec"
@@ -117,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     if not (app / "Contents" / "MacOS" / APP_NAME).is_file():
         raise RuntimeError("PyInstaller did not produce the expected app executable")
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "verify_macos_bundle.py"), str(app),
+                    "--arch", args.arch, "--target-macos", args.target_macos or minimum_macos], check=True)
     print(f"Built: {app}")
     if args.dmg:
         if not shutil.which("hdiutil"):
@@ -125,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             staging = Path(temporary)
             shutil.copytree(app, staging / app.name, symlinks=True)
             (staging / "Applications").symlink_to("/Applications")
-            image = dist_dir / f"Astra-Studio-5.0-{args.arch}.dmg"
+            image = dist_dir / f"Astra-Studio-5.0-{suffix}-macOS{minimum_macos}.dmg"
             subprocess.run(["hdiutil", "create", "-volname", APP_NAME, "-srcfolder", str(staging), "-format", "UDZO", "-ov", str(image)], check=True)
             print(f"Built: {image}")
     return 0

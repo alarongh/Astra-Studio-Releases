@@ -17,13 +17,38 @@ concurrency:
 
 jobs:
   verify:
-    name: Python 3.14 / ${{ matrix.os }}
+    name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            label: Windows / Python 3.14
+            python: '3.14'
+            requirements: requirements.txt
+          - os: macos-15-intel
+            label: Intel macOS 11 compatibility / Python 3.12
+            python: '3.12'
+            requirements: requirements-macos-intel-legacy.txt
+            arch: x86_64
+            target: '11.0'
+            variant: legacy
+          - os: macos-15-intel
+            label: Intel macOS 13+ / Python 3.14
+            python: '3.14'
+            requirements: requirements.txt
+            arch: x86_64
+            target: '13.0'
+            variant: standard
+          - os: macos-latest
+            label: Apple Silicon macOS 13+ / Python 3.14
+            python: '3.14'
+            requirements: requirements.txt
+            arch: arm64
+            target: '13.0'
+            variant: standard
     env:
       PYTHONUTF8: '1'
       QT_QPA_PLATFORM: offscreen
@@ -35,16 +60,16 @@ jobs:
         with:
           persist-credentials: false
       # Official actions/setup-python v7.1.0, verified against its release tag.
-      - name: Set up Python 3.14
+      - name: Set up build Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python }}
       - name: Create an isolated environment
         run: |
           python -m venv .venv
           python -c "import os; from pathlib import Path; scripts=Path('.venv').resolve()/('Scripts' if os.name=='nt' else 'bin'); handle=open(os.environ['GITHUB_PATH'],'a',encoding='utf-8'); handle.write(str(scripts)+'\n'); handle.close()"
       - name: Install pinned dependencies
-        run: python -m pip install -r requirements.txt -r requirements-test.txt
+        run: python -m pip install -r ${{ matrix.requirements }} -r requirements-test.txt
       - name: Compile application and tests
         run: python -m compileall -q main.py core scripts tests
       - name: Run offscreen regression tests
@@ -62,3 +87,19 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           python -c "from pathlib import Path; root=Path('dist')/'Astra Studio'; required=[root/'Astra Studio.exe',root/'_internal'/'data'/'python_libraries.json']; missing=[str(path) for path in required if not path.is_file()]; assert not missing, 'Missing package files: '+repr(missing)"
+      - name: Build macOS DMG and audit every native component
+        if: runner.os == 'macOS'
+        run: python scripts/build_macos.py --arch ${{ matrix.arch }} --target-macos ${{ matrix.target }} --variant ${{ matrix.variant }} --dmg
+      - name: Verify a clean installation from DMG
+        if: runner.os == 'macOS'
+        run: python scripts/verify_macos_install.py dist/macos-${{ matrix.arch }}-${{ matrix.variant }}/*.dmg
+      - name: Save verified macOS packages
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Astra-Studio-5.0-${{ matrix.arch }}-${{ matrix.variant }}
+          path: |
+            dist/macos-${{ matrix.arch }}-${{ matrix.variant }}/*.dmg
+            dist/macos-${{ matrix.arch }}-${{ matrix.variant }}/compatibility.json
+          if-no-files-found: error
+          retention-days: 14
