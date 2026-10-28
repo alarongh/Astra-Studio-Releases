@@ -197,7 +197,7 @@ from core.python_library_registry import (
 
 
 APP_NAME = "Astra Studio"
-APP_VERSION = "Release 4.0"
+APP_VERSION = "Release 5.0"
 WINDOWS_APP_USER_MODEL_ID = "Astra.Studio.Alaron"
 APP_DIR_NAME = "AstralStudio"
 PUBLIC_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/alarongh/Astra-Studio-Releases/main/update/latest.json"
@@ -211,7 +211,7 @@ ANGEL_404_THEME = "Angel 404: Фиолетовый сбой"
 ANGEL_404_ACCENT = "Angel 404 неон"
 ANGEL_404_WALLPAPER = "Angel 404"
 SHORTCUT_ICON_OPTIONS = {
-    "Astra 4.0 — красно-синий": "assets/astra.ico",
+    "Astra 5.0 — красно-синий": "assets/astra.ico",
     "Angel 404 — фиолетовый неон": "assets/astra_angel404.ico",
     "Astra Legacy — тёмная корона": "assets/legacy_astra.ico",
 }
@@ -4381,6 +4381,19 @@ class AstraStudio(QMainWindow):
             label.setWordWrap(True)
             label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        # Long option labels must not set the minimum width of the whole page.
+        # The popup still shows each full option when the closed combo shrinks.
+        for combo in settings_card.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+            combo.setMinimumWidth(0)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.btn_reset_window_sizes.setText("↺  Сбросить размеры окон")
+        self.btn_reset_appearance.setText("↺  Сбросить оформление")
+        self.btn_reset_fonts.setText("↺  Сбросить шрифт")
+        self.btn_reset_fonts.setToolTip("Восстановить шрифт и размеры текста по умолчанию")
+        self.btn_desktop_shortcut.setText("Создать или обновить\nярлык")
 
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setObjectName("PageScroll")

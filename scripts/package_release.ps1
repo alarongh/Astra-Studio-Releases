@@ -1,12 +1,16 @@
 param(
-    [string]$Version = "4.0",
+    [string]$Version = "5.0",
+    [string]$OutputDirectory = "",
     [switch]$SourceOnly
 )
 
 $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $releaseBase = Split-Path $projectRoot -Parent
-$outputDirectory = Join-Path $releaseBase "release_output"
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { $OutputDirectory = Join-Path $releaseBase "release_output" }
+$outputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+if ($outputDirectory.Equals($projectRoot, [StringComparison]::OrdinalIgnoreCase) -or $outputDirectory.StartsWith($projectRoot + "\", [StringComparison]::OrdinalIgnoreCase)) { throw "Output must be outside the source directory" }
+if ($Version -notmatch '^\d+\.\d+(?:\.\d+)?$') { throw "Invalid release version" }
 $versionSlug = $Version.Replace(".", "_")
 $sourceFolderName = "Astra_Studio_Release_${versionSlug}_FINAL_SOURCE"
 $stagingDirectory = Join-Path $outputDirectory $sourceFolderName
@@ -31,20 +35,28 @@ if (Test-Path -LiteralPath $stagingFull) {
 }
 New-Item -ItemType Directory -Path $stagingFull | Out-Null
 
-$excludedDirectories = '\\(?:\.venv|\.pytest_cache|\.pytest-tmp|__pycache__|build|dist)(?:\\|$)'
-$allSourceFiles = Get-ChildItem -LiteralPath $projectRoot -Recurse -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -notmatch $excludedDirectories -and $_.Extension -ne ".pyc" }
+function Get-AstraSourceFiles {
+    $excludedDirectories = '\\(?:\.git|\.venv|venv|\.pytest_cache|\.pytest-tmp|__pycache__|build|dist|\.mypy_cache|\.ruff_cache)(?:\\|$)'
+    if (Test-Path -LiteralPath (Join-Path $projectRoot '.git')) {
+        $paths = @(& git -c core.quotepath=false -C $projectRoot ls-files --cached --deduplicate)
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate tracked source files' }
+        $files = $paths | ForEach-Object { Get-Item -LiteralPath (Join-Path $projectRoot $_) -ErrorAction Stop }
+    } else {
+        $files = Get-ChildItem -LiteralPath $projectRoot -Recurse -File
+    }
+    $files | Where-Object { $_.FullName -notmatch $excludedDirectories -and $_.Extension -ne '.pyc' }
+}
+$allSourceFiles = @(Get-AstraSourceFiles)
 $manifestFiles = $allSourceFiles | Where-Object { $_.FullName -ne $manifestPath }
 $manifestLines = foreach ($file in ($manifestFiles | Sort-Object FullName)) {
     $relative = (Get-AstraRelativePath $projectRoot $file.FullName).Replace("\", "/")
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
     "$hash *$relative"
 }
-Set-Content -LiteralPath $manifestPath -Value $manifestLines -Encoding utf8
+[IO.File]::WriteAllText($manifestPath, (($manifestLines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
 
 # Include the newly regenerated manifest in the source payload.
-$allSourceFiles = Get-ChildItem -LiteralPath $projectRoot -Recurse -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -notmatch $excludedDirectories -and $_.Extension -ne ".pyc" }
+$allSourceFiles = @((Get-AstraSourceFiles | Where-Object { $_.FullName -ne $manifestPath })) + @(Get-Item -LiteralPath $manifestPath)
 foreach ($file in $allSourceFiles) {
     $relative = Get-AstraRelativePath $projectRoot $file.FullName
     $destination = Join-Path $stagingFull $relative
@@ -60,13 +72,14 @@ if (-not (Test-Path -LiteralPath (Join-Path $portableDirectory "Astra Studio.exe
     throw "Portable executable is missing. Build PyInstaller output first."
 }
 if (-not $SourceOnly) {
+    Copy-Item -LiteralPath (Join-Path $projectRoot "PORTABLE_README.md") -Destination (Join-Path $portableDirectory "README.md") -Force
     Compress-Archive -LiteralPath $portableDirectory -DestinationPath $portableZip -CompressionLevel Optimal -Force
 } elseif (-not (Test-Path -LiteralPath $portableZip -PathType Leaf)) {
     throw "SourceOnly requires an existing portable ZIP: $portableZip"
 }
 Compress-Archive -LiteralPath $stagingFull -DestinationPath $sourceZip -CompressionLevel Optimal -Force
 
-foreach ($document in @("TEST_REPORT_RELEASE_4_0.md", "PORTABLE_README.md", "UPDATE_DISTRIBUTION.md")) {
+foreach ($document in @("TEST_REPORT_RELEASE_${versionSlug}.md", "CHANGELOG.md", "PORTABLE_README.md", "UPDATE_DISTRIBUTION.md")) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $document) -Destination $outputDirectory -Force
 }
 $checksumLines = foreach ($artifact in @($portableZip, $sourceZip)) {

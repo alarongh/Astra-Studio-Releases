@@ -1,4 +1,4 @@
-# Astra Studio Release 4.0 — portable Windows
+# Astra Studio Release 5.0 — portable Windows
 
 ## Запуск
 

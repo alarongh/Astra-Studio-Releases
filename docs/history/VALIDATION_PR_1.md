@@ -63,7 +63,7 @@ generated Python/test caches were excluded from the import.
   second native teardown crash.
 - `scripts/build_macos.py` creates a native `.app` and optional `.dmg`, includes
   the read-only diagnostic script and resources, verifies the ad-hoc signature,
-  and records the actual Python/Qt minimum OS. See [MACOS.md](MACOS.md).
+  and records the actual Python/Qt minimum OS. See [MACOS.md](../../MACOS.md).
 - An absolute `ASTRA_DATA_DIR` permits isolated acceptance testing without
   relocating an existing user profile.
 

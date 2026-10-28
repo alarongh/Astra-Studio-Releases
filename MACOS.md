@@ -12,7 +12,7 @@ python3 -m venv .venv
 ```
 
 The output is `dist/macos-<arch>/Astra Studio.app` and, with `--dmg`,
-`Astra-Studio-4.0-<arch>.dmg` in the same directory. All build resources are
+`Astra-Studio-5.0-<arch>.dmg` in the same directory. All build resources are
 resolved from the script location, so invoking it from another working directory
 or a path containing spaces or Cyrillic is supported. The generated spec lives
 under ignored `build/`, and includes `assets`, `data/python_libraries.json`, and

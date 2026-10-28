@@ -1,7 +1,6 @@
 __pycache__/
 build/
 dist/
-*.spec
 *.pyc
 .venv/
 venv/
@@ -14,3 +13,6 @@ htmlcov/
 
 # Local AI context export
 PROJECT_CONTEXT.md
+
+# Local acceptance data
+.pytest-tmp/

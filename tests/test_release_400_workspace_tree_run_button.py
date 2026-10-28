@@ -122,8 +122,8 @@ def test_run_button_replaces_play_with_stop_for_compilation_and_restores(monkeyp
     app.processEvents()
 
 
-def test_release_identity_is_4_0():
+def test_release_identity_is_5_0():
     import main
 
-    assert main.APP_VERSION == "Release 4.0"
-    assert "Astra 4.0 — красно-синий" in main.SHORTCUT_ICON_OPTIONS
+    assert main.APP_VERSION == "Release 5.0"
+    assert "Astra 5.0 — красно-синий" in main.SHORTCUT_ICON_OPTIONS

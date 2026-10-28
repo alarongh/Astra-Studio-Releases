@@ -36,8 +36,8 @@ exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name={APP_NAME!r},
 collect = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name={APP_NAME!r})
 app = BUNDLE(collect, name={APP_NAME + ".app"!r}, icon={str(icon) if icon else None!r},
              bundle_identifier="org.astra.studio", info_plist={{
-                 "CFBundleShortVersionString": "4.0",
-                 "CFBundleVersion": "4.0",
+                 "CFBundleShortVersionString": "5.0",
+                 "CFBundleVersion": "5.0",
                  "LSMinimumSystemVersion": {minimum_macos!r},
                  "NSHighResolutionCapable": True,
              }})
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             staging = Path(temporary)
             shutil.copytree(app, staging / app.name, symlinks=True)
             (staging / "Applications").symlink_to("/Applications")
-            image = dist_dir / f"Astra-Studio-4.0-{args.arch}.dmg"
+            image = dist_dir / f"Astra-Studio-5.0-{args.arch}.dmg"
             subprocess.run(["hdiutil", "create", "-volname", APP_NAME, "-srcfolder", str(staging), "-format", "UDZO", "-ov", str(image)], check=True)
             print(f"Built: {image}")
     return 0

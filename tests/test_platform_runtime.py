@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 
 import pytest
@@ -59,7 +59,9 @@ def test_finder_tool_paths_do_not_include_current_project(tmp_path):
     paths = macos_tool_directories(tmp_path / "user")
     assert Path("/opt/homebrew/bin") in paths
     assert Path("/usr/local/bin") in paths
-    assert all(path.is_absolute() for path in paths)
+    # The two fixed macOS roots have POSIX semantics even on a Windows host.
+    assert all(PurePosixPath(path.as_posix()).is_absolute() for path in paths[:2])
+    assert all(path.is_absolute() for path in paths[2:])
     assert Path.cwd() not in paths
 
 

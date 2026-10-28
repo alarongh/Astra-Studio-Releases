@@ -59,7 +59,7 @@ def _function_language_branches(tree: ast.Module, name: str) -> set[str]:
 
 def test_final_release_identity_and_runtime_tree_has_no_dev_paths():
     tree = _main_tree()
-    assert _literal_assignment(tree, "APP_VERSION") == "Release 4.0"
+    assert _literal_assignment(tree, "APP_VERSION") == "Release 5.0"
     runtime_files = [MAIN, *sorted(CORE.glob("*.py")), *sorted(SCRIPTS.glob("*.ps1")), *sorted(ROOT.glob("*.bat")), *sorted(ROOT.glob("*.vbs"))]
     forbidden = ("/mnt/data", "Astra_Studio_Release_2_3", "Astra_Studio_Release_3_3_pre_", "Release 2.3")
     for path in runtime_files:
@@ -72,7 +72,7 @@ def test_final_release_identity_and_runtime_tree_has_no_dev_paths():
 
 
 def test_all_roadmap_scope_before_final_gate_is_closed():
-    text = (ROOT / "ROADMAP_3_X.md").read_text(encoding="utf-8")
+    text = (ROOT / "docs" / "history" / "ROADMAP_3_X.md").read_text(encoding="utf-8")
     before_gate = text.split("## Final integration gate before 4.0", 1)[0]
     assert "- [ ]" not in before_gate
     for marker in (
@@ -252,16 +252,16 @@ def test_test_registry_exactly_matches_pytest_collection():
         check=True,
     )
     collected = {line.strip() for line in completed.stdout.splitlines() if line.strip().startswith("tests/") and "::" in line}
-    registry = (ROOT / "TEST_REGISTRY_3_X.md").read_text(encoding="utf-8")
+    registry = (ROOT / "docs" / "TEST_REGISTRY.md").read_text(encoding="utf-8")
     registered = set(re.findall(r'^- `([^`]+::[^`]+)`$', registry, flags=re.MULTILINE))
     assert collected == registered
 
 
 def test_final_docs_no_longer_claim_d3_is_next():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    changelog = (ROOT / "CHANGELOG_RELEASE_3_3.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "docs" / "history" / "CHANGELOG_RELEASE_3_3.md").read_text(encoding="utf-8")
     assert "D3 AI-adjacent workflow NEXT" not in readme
-    assert "Release 4.0" in readme
+    assert "Release 5.0" in readme
     assert "Final Integration Gate" in readme
     assert "D1–D3" in changelog
 
@@ -296,6 +296,6 @@ def test_runtime_classes_do_not_accidentally_redefine_methods():
 
 
 def test_owner_acceptance_registry_keeps_final_windows_checks_pending():
-    registry = (ROOT / "TEST_REGISTRY_3_X.md").read_text(encoding="utf-8")
+    registry = (ROOT / "docs" / "TEST_REGISTRY.md").read_text(encoding="utf-8")
     for number in range(13, 17):
         assert f'- [ ] `FINAL-{number:02d}`' in registry

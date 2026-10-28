@@ -20,7 +20,7 @@ def test_release_identity_update_fallback_and_shortcut_script_are_packaged():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     spec = (ROOT / "astra_studio.spec").read_text(encoding="utf-8")
 
-    assert 'APP_VERSION = "Release 4.0"' in source
+    assert 'APP_VERSION = "Release 5.0"' in source
     assert 'PUBLIC_UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/alarongh/Astra-Studio-Releases/main/update/latest.json"' in source
     assert 'configured_manifest_url(resource_path("update_channel.json")) or PUBLIC_UPDATE_MANIFEST_URL' in source
     assert '("scripts/create_desktop_shortcut.ps1", "scripts")' in spec

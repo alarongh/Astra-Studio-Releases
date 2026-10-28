@@ -43,6 +43,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon=["assets/astra.ico"],
+    version="assets/windows_version_info.txt",
 )
 
 collect = COLLECT(

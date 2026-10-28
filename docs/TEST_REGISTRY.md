@@ -1,4 +1,4 @@
-# Astra Studio 3.x — Test Registry
+# Astra Studio 5.0 — Test Registry
 
 
 Этот файл — единый реестр тестов поколения 3.x. Он нужен, чтобы ни один автоматический или ручной тест не потерялся к финальному Windows-прогону поколения 3.x и post-gate патчам.
@@ -10,13 +10,13 @@
 
 ## Автоматические тесты, уже присутствующие в проекте
 
-Обновлено для проверенной основы 4.0 и текущих регрессионных тестов.
+Обновлено для Release 5.0; исторические ручные проверки сохранены с исходными статусами.
 
 - `tests/test_angel_404_theme.py::test_angel_404_font_is_bundled_and_builtin_photo_is_retired`
 - `tests/test_angel_404_theme.py::test_angel_404_theme_profile_uses_solid_background`
 - `tests/test_angel_404_theme.py::test_minecraft_font_loads_and_reaches_editor_document`
 - `tests/test_angel_404_theme.py::test_minecraft_font_selection_is_global_and_persistent`
-- `tests/test_app_updates.py::test_release_400_bundles_public_github_channel_and_valid_latest_manifest`
+- `tests/test_app_updates.py::test_release_500_bundles_public_github_channel_and_valid_latest_manifest`
 - `tests/test_app_updates.py::test_release_versions_compare_numerically`
 - `tests/test_app_updates.py::test_update_archive_verifies_hash_size_layout_and_rejects_traversal`
 - `tests/test_app_updates.py::test_update_channel_accepts_published_https_url`
@@ -359,7 +359,7 @@
 - `tests/test_release_400_workspace_tree_run_button.py::test_internal_workspace_archives_old_language_examples`
 - `tests/test_release_400_workspace_tree_run_button.py::test_project_tree_can_be_resized_wide_and_is_not_auto_hidden`
 - `tests/test_release_400_workspace_tree_run_button.py::test_project_tree_shows_six_languages_and_neutral_files`
-- `tests/test_release_400_workspace_tree_run_button.py::test_release_identity_is_4_0`
+- `tests/test_release_400_workspace_tree_run_button.py::test_release_identity_is_5_0`
 - `tests/test_release_400_workspace_tree_run_button.py::test_run_button_replaces_play_with_stop_for_compilation_and_restores`
 - `tests/test_security_regressions.py::test_atomic_bulk_replace_does_not_change_external_hardlink`
 - `tests/test_security_regressions.py::test_batch_arguments_are_always_quoted_and_delayed_expansion_disabled`
